@@ -1,0 +1,20 @@
+services:
+  relay:
+    build: .
+    container_name: 1min-bridge
+    ports:
+      - "3000:3000"
+    environment:
+      # Optional: restrict to specific models (comma-separated)
+      # - ALLOWED_MODELS=gpt-5,claude-sonnet-4-5-20250929,gemini-2.5-pro
+      # Optional: cache TTL in ms (default 1800000 = 30 min)
+      # - CACHE_TTL_MS=1800000
+      # Optional: log level (debug, info, warn, error)
+      # - LOG_LEVEL=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -1,0 +1,85 @@
+// ============================================================================
+// 1min-relay — Rate Limiting Middleware (in-memory token bucket)
+// ============================================================================
+
+import type { Context, Next } from "hono";
+import { rateLimitError, sendError } from "../errors.js";
+import type { Env } from "../types.js";
+
+interface Bucket {
+  tokens: number;
+  lastRefill: number;
+}
+
+interface RateLimitOptions {
+  maxRequests: number;
+  windowMs: number;
+  keyFn?: (c: Context<Env>) => string;
+}
+
+const buckets = new Map<string, Bucket>();
+
+// Cleanup stale buckets every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, bucket] of buckets) {
+    if (now - bucket.lastRefill > 600_000) {
+      buckets.delete(key);
+    }
+  }
+}, 300_000);
+
+function getBucket(key: string, maxRequests: number): Bucket {
+  let bucket = buckets.get(key);
+  const now = Date.now();
+
+  if (!bucket) {
+    bucket = { tokens: maxRequests, lastRefill: now };
+    buckets.set(key, bucket);
+    return bucket;
+  }
+
+  // Refill tokens based on elapsed time
+  const elapsed = now - bucket.lastRefill;
+  const refillRate = maxRequests;
+  const tokensToAdd = Math.floor((elapsed / 60_000) * refillRate);
+  bucket.tokens = Math.min(maxRequests, bucket.tokens + tokensToAdd);
+  bucket.lastRefill = now;
+
+  return bucket;
+}
+
+export function rateLimitMiddleware(
+  options: Partial<RateLimitOptions> = {},
+) {
+  const {
+    maxRequests = 60,
+    windowMs = 60_000,
+    keyFn = (c: Context<Env>): string => {
+      const apiKey = c.get("oneMinApiKey");
+      return apiKey ?? c.req.header("x-forwarded-for") ?? "anonymous";
+    },
+  } = options;
+
+  return async function rateLimit(
+    c: Context<Env>,
+    next: Next,
+  ): Promise<Response | void> {
+    const key = keyFn(c);
+    const bucket = getBucket(key, maxRequests);
+
+    if (bucket.tokens <= 0) {
+      const retryAfterSec = Math.ceil(windowMs / 1000);
+      c.header("Retry-After", String(retryAfterSec));
+      c.header("X-RateLimit-Limit", String(maxRequests));
+      c.header("X-RateLimit-Remaining", "0");
+      return sendError(c, rateLimitError());
+    }
+
+    bucket.tokens -= 1;
+    c.header("X-RateLimit-Limit", String(maxRequests));
+    c.header("X-RateLimit-Remaining", String(bucket.tokens));
+
+    await next();
+  };
+}
