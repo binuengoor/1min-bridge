@@ -212,6 +212,7 @@ export interface AppConfig {
   cacheTtlMs: number;
   allowedModels?: string[];
   logLevel: "debug" | "info" | "warn" | "error";
+  defaultApiKey?: string;
 }
 
 // ---------------------------------------------------------------------------
