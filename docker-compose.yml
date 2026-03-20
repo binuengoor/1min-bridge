@@ -1,5 +1,5 @@
 services:
-  bridge:
+  1min-bridge:
     image: ghcr.io/binuengoor/1min-bridge:latest
     container_name: 1min-bridge
     ports:
