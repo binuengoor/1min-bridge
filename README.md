@@ -39,8 +39,9 @@ Unlike existing relays that hardcode model lists, 1min-bridge fetches available 
 docker run -d \
   --name 1min-bridge \
   -p 3000:3000 \
-  -e ONE_MIN_API_KEY=your_1min_api_key \
   ghcr.io/binuengoor/1min-bridge:latest
+
+Clients pass their 1min.ai API key in the `Authorization: Bearer <key>` header per request — no server-side key needed.
 ```
 
 Then use it like any OpenAI-compatible endpoint:
@@ -89,7 +90,6 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - ONE_MIN_API_KEY=your_1min_api_key
       # Optional: restrict to specific models (comma-separated)
       # - ALLOWED_MODELS=gpt-5,claude-sonnet-4-5-20250929,gemini-2.5-pro
       # Optional: cache TTL in ms (default 1800000 = 30 min)

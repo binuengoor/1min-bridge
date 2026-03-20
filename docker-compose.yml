@@ -5,7 +5,6 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - ONE_MIN_API_KEY=${ONE_MIN_API_KEY}
       # Optional: restrict to specific models (comma-separated)
       # - ALLOWED_MODELS=gpt-5,claude-sonnet-4-5-20250929,gemini-2.5-pro
       # Optional: cache TTL in ms (default 1800000 = 30 min)
