@@ -15,8 +15,9 @@ import type {
 const app = new Hono<Env>();
 
 const youtubeRequestSchema = z.object({
-  model: z.string().optional().default("gemini-2.0-flash"),
+  model: z.string().optional().default("gpt-4.1"),
   youtube_url: z.string().url("youtube_url must be a valid URL"),
+  language: z.string().optional().default("English"),
   max_tokens: z.number().int().positive().optional(),
 });
 
@@ -41,7 +42,8 @@ app.post("/v1/engines/youtube/summarize", async (c) => {
     type: "YOUTUBE_SUMMARIZER",
     model: body.model,
     promptObject: {
-      prompt: body.youtube_url,
+      videoUrl: body.youtube_url,
+      language: body.language,
       ...(body.max_tokens !== undefined ? { maxTokens: body.max_tokens } : {}),
     },
   };
