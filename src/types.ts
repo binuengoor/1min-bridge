@@ -76,7 +76,7 @@ export interface CachedModelData {
 // ---------------------------------------------------------------------------
 
 export interface ChatMessage {
-  role: "system" | "user" | "assistant" | "tool";
+  role: "system" | "developer" | "user" | "assistant" | "tool" | "function";
   content: string | ChatContentPart[];
   tool_calls?: ToolCall[];
   tool_call_id?: string;

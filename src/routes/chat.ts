@@ -108,7 +108,7 @@ const chatContentPartSchema = z.object({
 });
 
 const chatMessageSchema = z.object({
-  role: z.enum(["system", "user", "assistant", "tool"]),
+  role: z.enum(["system", "developer", "user", "assistant", "tool", "function"]) ,
   content: z.union([z.string(), z.array(chatContentPartSchema)]),
   name: z.string().optional(),
   tool_calls: z
@@ -178,11 +178,11 @@ function formatMessagesFor1Min(
 
   for (const m of messages) {
     const roleLabel =
-      m.role === "system"
+      m.role === "system" || m.role === "developer"
         ? "System"
         : m.role === "assistant"
           ? "Assistant"
-          : m.role === "tool"
+          : m.role === "tool" || m.role === "function"
             ? "Tool Result"
             : "Human";
 
