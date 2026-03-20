@@ -66,9 +66,15 @@ app.post("/v1/images/generations", async (c) => {
       urls = [resultObj];
     }
 
+    // Fix relative image paths from 1min.ai
+    const ONEMIN_BASE = "https://api.1min.ai/";
+    const resolvedUrls = urls.map((url) =>
+      url.startsWith("http") ? url : `${ONEMIN_BASE}${url}`
+    );
+
     const response: ImageGenerationResponse = {
       created: Math.floor(Date.now() / 1000),
-      data: urls.map((url) => ({ url })),
+      data: resolvedUrls.map((url) => ({ url })),
     };
 
     return c.json(response);

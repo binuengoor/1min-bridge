@@ -246,6 +246,10 @@ async function extractImageUrls(
   return urls;
 }
 
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
 function newChatId(): string {
   return `chatcmpl-${crypto.randomUUID()}`;
 }
@@ -617,9 +621,9 @@ app.post("/v1/chat/completions", async (c) => {
         },
       ],
       usage: {
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
+        prompt_tokens: estimateTokens(prompt),
+        completion_tokens: estimateTokens(content),
+        total_tokens: estimateTokens(prompt) + estimateTokens(content),
       },
     };
 

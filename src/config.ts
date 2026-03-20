@@ -17,6 +17,7 @@ const envSchema = z.object({
   CACHE_TTL_MS: z.string().default("1800000"),
   ALLOWED_MODELS: z.string().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
+  LOG_FORMAT: z.enum(["text", "json"]).default("text"),
   ONE_MIN_API_KEY: z.string().optional(),
 });
 
@@ -37,6 +38,7 @@ function loadConfig(): AppConfig {
     cacheTtlMs: parseInt(env.CACHE_TTL_MS, 10),
     allowedModels,
     logLevel: env.LOG_LEVEL,
+    logFormat: env.LOG_FORMAT,
     defaultApiKey: env.ONE_MIN_API_KEY || undefined,
   };
 }
