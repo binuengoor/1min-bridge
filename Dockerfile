@@ -7,6 +7,8 @@ FROM node:22-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
 COPY tsconfig.json ./
 COPY src/ ./src/
 RUN npx tsc

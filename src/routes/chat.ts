@@ -108,7 +108,10 @@ const chatContentPartSchema = z.object({
 });
 
 const chatMessageSchema = z.object({
-  role: z.enum(["system", "developer", "user", "assistant", "tool", "function"]) ,
+  role: z.union([
+    z.literal("system"), z.literal("developer"), z.literal("user"),
+    z.literal("assistant"), z.literal("tool"), z.literal("function"),
+  ]),
   content: z.union([z.string(), z.array(chatContentPartSchema)]),
   name: z.string().optional(),
   tool_calls: z
