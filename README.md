@@ -1,6 +1,6 @@
 # 1min-bridge
 
-[![Docker](https://img.shields.io/badge/Docker-ready-blue?logo=docker)](https://hub.docker.com)
+[![Docker](https://img.shields.io/badge/GHCR-ghcr.io%2Fbinuengoor%2F1min--bridge-blue?logo=docker)](https://github.com/binuengoor/1min-bridge/pkgs/container/1min-bridge)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
 [![OpenAI Compatible](https://img.shields.io/badge/OpenAI-API--compatible-green)](https://platform.openai.com/docs/api-reference)
 
@@ -40,7 +40,7 @@ docker run -d \
   --name 1min-bridge \
   -p 3000:3000 \
   -e ONE_MIN_API_KEY=your_1min_api_key \
-  1min-bridge
+  ghcr.io/binuengoor/1min-bridge:latest
 ```
 
 Then use it like any OpenAI-compatible endpoint:
@@ -83,17 +83,19 @@ curl http://localhost:3000/v1/audio/transcriptions \
 
 ```yaml
 services:
-  1min-bridge:
-    image: 1min-bridge
+  bridge:
+    image: ghcr.io/binuengoor/1min-bridge:latest
     container_name: 1min-bridge
     ports:
       - "3000:3000"
     environment:
-      ONE_MIN_API_KEY: your_1min_api_key
-      PORT: "3000"
-      CACHE_TTL_MS: "1800000"        # 30 minutes
-      ALLOWED_MODELS: ""              # empty = all models (comma-separated IDs)
-      LOG_LEVEL: "info"              # debug | info | warn | error
+      - ONE_MIN_API_KEY=your_1min_api_key
+      # Optional: restrict to specific models (comma-separated)
+      # - ALLOWED_MODELS=gpt-5,claude-sonnet-4-5-20250929,gemini-2.5-pro
+      # Optional: cache TTL in ms (default 1800000 = 30 min)
+      # - CACHE_TTL_MS=1800000
+      # Optional: log level (debug, info, warn, error)
+      # - LOG_LEVEL=info
     restart: unless-stopped
 ```
 
