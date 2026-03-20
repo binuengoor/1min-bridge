@@ -28,6 +28,11 @@ Unlike existing relays that hardcode model lists, 1min-bridge fetches available 
 - **Per-IP rate limiting** — 60 requests/minute token bucket
 - **Zod validation** — all request bodies validated with clear, structured error messages
 - **OpenAPI / Swagger docs** — interactive API documentation at `/docs`
+- **Token estimation** — approximated prompt/completion token counts in responses
+- **Prometheus metrics** — `GET /metrics` with request counters and duration histograms
+- **JSON logging** — set `LOG_FORMAT=json` for structured production logs
+- **Graceful shutdown** — drains in-flight requests (10s timeout) before stopping
+- **Version endpoint** — `/health` includes git commit hash from build
 - **Docker-first** — ~80MB multi-stage build, zero config required
 - **Strict TypeScript** — zero `any`, `noUncheckedIndexedAccess`, full type safety
 
@@ -108,6 +113,8 @@ services:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `LOG_FORMAT` | `text` | Log format: `text` (dev) or `json` (production) |
+| `NODE_ENV` | — | When `production`, auto-enables JSON logging |
 | `ONE_MIN_API_KEY` | *(required)* | Your 1min.ai API key (passed as Bearer token by clients) |
 | `PORT` | `3000` | Server port |
 | `CACHE_TTL_MS` | `1800000` | Model cache TTL in milliseconds (30 min) |
@@ -252,9 +259,9 @@ curl http://localhost:3000/v1/chat/completions \
     }
   ],
   "usage": {
-    "prompt_tokens": 0,
-    "completion_tokens": 0,
-    "total_tokens": 0
+    "prompt_tokens": 15,
+    "completion_tokens": 2,
+    "total_tokens": 17
   }
 }
 ```
@@ -448,7 +455,26 @@ curl http://localhost:3000/v1/engines/youtube/summarize \
 
 ---
 
+### `GET /metrics`
+
+Prometheus-compatible metrics endpoint (no auth required).
+
+```
+# HELP 1min_bridge_requests_total Total HTTP requests
+# TYPE 1min_bridge_requests_total counter
+1min_bridge_requests_total{method="POST",path="/v1/chat/completions",status="200"} 42
+
+# HELP 1min_bridge_request_duration_seconds Request duration in seconds
+# TYPE 1min_bridge_request_duration_seconds histogram
+1min_bridge_request_duration_seconds_bucket{le="0.5"} 38
+1min_bridge_request_duration_seconds_bucket{le="1"} 41
+1min_bridge_request_duration_seconds_bucket{le="+Inf"} 42
+1min_bridge_request_duration_seconds_sum 15.2
+1min_bridge_request_duration_seconds_count 42
+```
+
 ### `GET /docs`
+
 
 Interactive Swagger UI documentation (browser).
 
