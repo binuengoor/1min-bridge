@@ -7,8 +7,8 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { getModelData } from "../model-registry.js";
 import {
-  callFeature,
-  callFeatureStream,
+  callChat,
+  callChatStream,
 } from "../adapters/onemin.js";
 import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
 import { ResponseSanitizer } from "../adapters/sanitizer.js";
@@ -178,7 +178,7 @@ app.post("/v1/responses", async (c) => {
   const created = nowSec();
 
   const payload = {
-    type: "CHAT_WITH_AI",
+    type: "UNIFY_CHAT_WITH_AI",
     model: cleanModel,
     promptObject: {
       prompt,
@@ -190,14 +190,14 @@ app.post("/v1/responses", async (c) => {
 
   try {
     if (body.stream) {
-      const upstream = await callFeatureStream(apiKey, payload);
+      const streamBody = await callChatStream(apiKey, payload);
       const encoder = new TextEncoder();
       const promptTokens = calculateTokens(prompt);
 
       return new Response(
         new ReadableStream({
           async start(controller) {
-            const reader = upstream.body!.getReader();
+            const reader = streamBody.getReader();
             const decoder = new TextDecoder();
             let buffer = "";
             let fullContent = "";
@@ -290,7 +290,7 @@ app.post("/v1/responses", async (c) => {
     }
 
     // Non-streaming
-    const data = await callFeature(apiKey, payload);
+    const data = await callChat(apiKey, payload);
     const resultObj = data.aiRecord?.aiRecordDetail?.resultObject;
     let rawContent = "";
     if (typeof resultObj === "string") {

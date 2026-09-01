@@ -10,9 +10,8 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { getModelData, isVisionModel } from "../model-registry.js";
 import {
-  callFeature,
-  callFeatureStream,
-  callFeatureStreamStructured,
+  callChat,
+  callChatStream,
   uploadAsset,
 } from "../adapters/onemin.js";
 import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
@@ -41,7 +40,7 @@ const FEATURE_SUFFIX_MAP: Record<string, string> = {
   ":pdf": "CHAT_WITH_PDF",
   ":summarize": "SUMMARIZER",
   ":code": "CODE_GENERATOR",
-  ":online": "CHAT_WITH_AI", // special: triggers webSearch flag
+  ":online": "UNIFY_CHAT_WITH_AI", // special: triggers webSearch flag
 };
 
 function resolveFeatureType(modelName: string): {
@@ -52,14 +51,14 @@ function resolveFeatureType(modelName: string): {
   for (const [suffix, featureType] of Object.entries(FEATURE_SUFFIX_MAP)) {
     if (modelName.endsWith(suffix)) {
       return {
-        featureType: suffix === ":online" ? "CHAT_WITH_AI" : featureType,
+        featureType: suffix === ":online" ? "UNIFY_CHAT_WITH_AI" : featureType,
         cleanModel: modelName.slice(0, -suffix.length),
         webSearch: suffix === ":online",
       };
     }
   }
   return {
-    featureType: "CHAT_WITH_AI",
+    featureType: "UNIFY_CHAT_WITH_AI",
     cleanModel: modelName,
     webSearch: false,
   };
@@ -576,35 +575,12 @@ app.post("/v1/chat/completions", async (c) => {
         promptTokens: calculateTokens(prompt),
       };
 
-      // Try structured UNIFY_CHAT_WITH_AI first, fall back to legacy
-      let streamBody: ReadableStream<Uint8Array> | null = null;
-      if (resolvedFeatureType === "CHAT_WITH_AI" && !isVision) {
-        try {
-          streamBody = await callFeatureStreamStructured(apiKey, payload);
-        } catch (err) {
-          console.warn(
-            "UNIFY_CHAT_WITH_AI failed, falling back to legacy:",
-            (err as Error).message,
-          );
-        }
-      }
-
-      if (streamBody) {
-        const syntheticResponse = new Response(streamBody, {
-          headers: { "Content-Type": "text/event-stream" },
-        });
-        return buildStreamingResponse(
-          syntheticResponse,
-          cleanModel,
-          chatId,
-          streamingOptions,
-        );
-      }
-
-      // Fallback: legacy streaming
-      const upstream = await callFeatureStream(apiKey, payload);
+      const streamBody = await callChatStream(apiKey, payload);
+      const syntheticResponse = new Response(streamBody, {
+        headers: { "Content-Type": "text/event-stream" },
+      });
       return buildStreamingResponse(
-        upstream,
+        syntheticResponse,
         cleanModel,
         chatId,
         streamingOptions,
@@ -612,7 +588,7 @@ app.post("/v1/chat/completions", async (c) => {
     }
 
     // Non-streaming
-    const data = await callFeature(apiKey, payload);
+    const data = await callChat(apiKey, payload);
     const resultObj = data.aiRecord?.aiRecordDetail?.resultObject;
     let rawContent = "";
     if (typeof resultObj === "string") {

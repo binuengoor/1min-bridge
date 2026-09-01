@@ -12,6 +12,14 @@ const envSchema = z.object({
     .string()
     .url()
     .default("https://api.1min.ai/api/features?isStreaming=true"),
+  ONE_MIN_CHAT_API_URL: z
+    .string()
+    .url()
+    .default("https://api.1min.ai/api/chat-with-ai"),
+  ONE_MIN_CHAT_STREAMING_URL: z
+    .string()
+    .url()
+    .default("https://api.1min.ai/api/chat-with-ai?isStreaming=true"),
   ONE_MIN_MODELS_URL: z.string().url().default("https://api.1min.ai/models"),
   ONE_MIN_ASSET_URL: z.string().url().default("https://api.1min.ai/api/assets"),
   CACHE_TTL_MS: z.string().default("1800000"),
@@ -47,6 +55,8 @@ function loadConfig(): AppConfig {
     port: parseInt(env.PORT, 10),
     oneMinApiUrl: env.ONE_MIN_API_URL,
     oneMinStreamingUrl: env.ONE_MIN_STREAMING_URL,
+    oneMinChatApiUrl: env.ONE_MIN_CHAT_API_URL,
+    oneMinChatStreamingUrl: env.ONE_MIN_CHAT_STREAMING_URL,
     oneMinModelsUrl: env.ONE_MIN_MODELS_URL,
     oneMinAssetUrl: env.ONE_MIN_ASSET_URL,
     cacheTtlMs: parseInt(env.CACHE_TTL_MS, 10),

@@ -421,6 +421,8 @@ export interface AppConfig {
   port: number;
   oneMinApiUrl: string;
   oneMinStreamingUrl: string;
+  oneMinChatApiUrl: string;
+  oneMinChatStreamingUrl: string;
   oneMinModelsUrl: string;
   oneMinAssetUrl: string;
   cacheTtlMs: number;
