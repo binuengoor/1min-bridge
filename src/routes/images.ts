@@ -47,7 +47,7 @@ const RESILIENT_FALLBACKS = [
   "stable-diffusion-xl-1024-v1-0",
 ];
 
-app.post("/v1/images/generations", async (c) => {
+const handleImageGeneration = async (c: any) => {
   const apiKey = c.get("oneMinApiKey");
 
   let body: ImageGenerationRequest;
@@ -170,6 +170,10 @@ app.post("/v1/images/generations", async (c) => {
   };
 
   return c.json(response);
-});
+};
+
+app.post("/v1/images/generations", handleImageGeneration);
+app.post("/images/generations", handleImageGeneration);
+app.post("/api/v1/images/generations", handleImageGeneration);
 
 export default app;

@@ -198,6 +198,8 @@ app.use("/v1/messages/*", authMiddleware, rateLimit);
 app.use("/v1/responses", authMiddleware, rateLimit);
 app.use("/v1/responses/*", authMiddleware, rateLimit);
 app.use("/v1/images/*", authMiddleware, rateLimit);
+app.use("/images/*", authMiddleware, rateLimit);
+app.use("/api/v1/images/*", authMiddleware, rateLimit);
 app.use("/v1/audio/*", authMiddleware, rateLimit);
 app.use("/v1/search", authMiddleware, rateLimit);
 app.use("/v1/web/*", authMiddleware, rateLimit);
