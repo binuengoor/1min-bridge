@@ -6,13 +6,13 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { getModelData } from "../model-registry.js";
 import { callFeature } from "../adapters/onemin.js";
-import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
+import { invalidRequestError, sendError } from "../errors.js";
 import type { Env, ImageGenerationRequest, ImageGenerationResponse } from "../types.js";
 
 const app = new Hono<Env>();
 
 const imageRequestSchema = z.object({
-  model: z.string().optional().default("flux-schnell"),
+  model: z.string().optional().default("gemini-2.5-flash-image"),
   prompt: z.string().min(1),
   n: z.number().int().min(1).max(10).optional().default(1),
   size: z.string().optional().default("1024x1024"),
@@ -22,6 +22,22 @@ const imageRequestSchema = z.object({
   output_format: z.enum(["png", "jpeg", "webp"]).optional(),
   output_quality: z.number().min(1).max(100).optional(),
 });
+
+const IMAGE_MODEL_ALIASES: Record<string, string> = {
+  "dall-e-3": "gemini-2.5-flash-image",
+  "dall-e-2": "gemini-2.5-flash-image",
+  "dall-e": "gemini-2.5-flash-image",
+  "flux-schnell": "gemini-2.5-flash-image",
+  "black-forest-labs/flux-schnell": "gemini-2.5-flash-image",
+  "flux-dev": "black-forest-labs/flux-2-dev",
+  "flux-pro": "black-forest-labs/flux-2-pro",
+  "flux-2-klein": "black-forest-labs/flux-2-klein-4b",
+  "sdxl": "stable-diffusion-xl-1024-v1-0",
+  "stable-diffusion": "stable-diffusion-xl-1024-v1-0",
+  "midjourney": "magic-art_7_0",
+  "gemini-flash": "gemini-2.5-flash-image",
+  "gemini-pro": "gemini-3-pro-image-preview",
+};
 
 app.post("/v1/images/generations", async (c) => {
   const apiKey = c.get("oneMinApiKey");
@@ -40,13 +56,14 @@ app.post("/v1/images/generations", async (c) => {
     return sendError(c, invalidRequestError("Invalid JSON body"));
   }
 
-  const model = body.model ?? "flux-schnell";
-  c.set("model", model);
+  const requestedModel = body.model ?? "gemini-2.5-flash-image";
+  let model = IMAGE_MODEL_ALIASES[requestedModel] ?? requestedModel;
   const modelData = await getModelData();
 
-  if (!modelData.imageModelIds.includes(model)) {
-    return sendError(c, modelNotFoundError(model));
+  if (!modelData.imageModelIds.includes(model) && !Object.values(IMAGE_MODEL_ALIASES).includes(model)) {
+    model = "gemini-2.5-flash-image";
   }
+  c.set("model", model);
 
   const promptObject: Record<string, unknown> = {
     prompt: body.prompt,
