@@ -144,23 +144,19 @@ const handleImageGeneration = async (c: any) => {
     return `${S3_BASE}${url.replace(/^\/+/, "")}`;
   });
 
-  const isB64Requested = body.response_format === "b64_json";
-
   const imageItems = await Promise.all(
     resolvedUrls.map(async (url) => {
-      if (isB64Requested) {
-        try {
-          const imgRes = await fetch(url);
-          if (imgRes.ok) {
-            const arrBuf = await imgRes.arrayBuffer();
-            const b64 = Buffer.from(arrBuf).toString("base64");
-            return { b64_json: b64, url };
-          }
-        } catch (err) {
-          console.error("Failed to convert image to b64_json:", err);
+      let b64: string | undefined = undefined;
+      try {
+        const imgRes = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+        if (imgRes.ok) {
+          const arrBuf = await imgRes.arrayBuffer();
+          b64 = Buffer.from(arrBuf).toString("base64");
         }
+      } catch (err) {
+        console.error("Failed to convert image to b64_json:", err);
       }
-      return { url };
+      return b64 ? { url, b64_json: b64 } : { url };
     }),
   );
 
