@@ -51,7 +51,11 @@ app.post("/v1/images/generations", async (c) => {
   const promptObject: Record<string, unknown> = {
     prompt: body.prompt,
     n: body.n ?? 1,
+    samples: body.n ?? 1,
     size: body.size ?? "1024x1024",
+    imageSize: body.size === "512x512" ? "512" : body.size === "2048x2048" ? "2K" : "1K",
+    quality: body.quality ?? "standard",
+    aspectRatio: "1:1",
   };
 
   if (body.output_format) promptObject.output_format = body.output_format;
