@@ -11,24 +11,26 @@ import type { Env, ImageGenerationRequest, ImageGenerationResponse } from "../ty
 
 const app = new Hono<Env>();
 
-const imageRequestSchema = z.object({
-  model: z.string().optional().default("gemini-2.5-flash-image"),
-  prompt: z.string().min(1),
-  n: z.number().int().min(1).max(10).optional().default(1),
-  size: z.string().optional().default("1024x1024"),
-  response_format: z.enum(["url", "b64_json"]).optional().default("url"),
-  quality: z.enum(["standard", "hd"]).optional(),
-  style: z.enum(["vivid", "natural"]).optional(),
-  output_format: z.enum(["png", "jpeg", "webp"]).optional(),
-  output_quality: z.number().min(1).max(100).optional(),
-});
+const imageRequestSchema = z
+  .object({
+    model: z.string().optional().default("black-forest-labs/flux-2-klein-4b"),
+    prompt: z.string().min(1),
+    n: z.number().optional().default(1),
+    size: z.string().optional().default("1024x1024"),
+    response_format: z.string().optional().default("url"),
+    quality: z.string().optional(),
+    style: z.string().optional(),
+    output_format: z.string().optional(),
+    output_quality: z.number().optional(),
+  })
+  .passthrough();
 
 const IMAGE_MODEL_ALIASES: Record<string, string> = {
-  "dall-e-3": "gemini-2.5-flash-image",
-  "dall-e-2": "gemini-2.5-flash-image",
-  "dall-e": "gemini-2.5-flash-image",
-  "flux-schnell": "gemini-2.5-flash-image",
-  "black-forest-labs/flux-schnell": "gemini-2.5-flash-image",
+  "dall-e-3": "black-forest-labs/flux-2-klein-4b",
+  "dall-e-2": "black-forest-labs/flux-2-klein-4b",
+  "dall-e": "black-forest-labs/flux-2-klein-4b",
+  "flux-schnell": "black-forest-labs/flux-2-klein-4b",
+  "black-forest-labs/flux-schnell": "black-forest-labs/flux-2-klein-4b",
   "flux-dev": "black-forest-labs/flux-2-dev",
   "flux-pro": "black-forest-labs/flux-2-pro",
   "flux-2-klein": "black-forest-labs/flux-2-klein-4b",
@@ -38,6 +40,12 @@ const IMAGE_MODEL_ALIASES: Record<string, string> = {
   "gemini-flash": "gemini-2.5-flash-image",
   "gemini-pro": "gemini-3-pro-image-preview",
 };
+
+const RESILIENT_FALLBACKS = [
+  "black-forest-labs/flux-2-klein-4b",
+  "gemini-2.5-flash-image",
+  "stable-diffusion-xl-1024-v1-0",
+];
 
 app.post("/v1/images/generations", async (c) => {
   const apiKey = c.get("oneMinApiKey");
@@ -56,14 +64,14 @@ app.post("/v1/images/generations", async (c) => {
     return sendError(c, invalidRequestError("Invalid JSON body"));
   }
 
-  const requestedModel = body.model ?? "gemini-2.5-flash-image";
-  let model = IMAGE_MODEL_ALIASES[requestedModel] ?? requestedModel;
+  const requestedModel = body.model ?? "black-forest-labs/flux-2-klein-4b";
+  let primaryModel = IMAGE_MODEL_ALIASES[requestedModel] ?? requestedModel;
   const modelData = await getModelData();
 
-  if (!modelData.imageModelIds.includes(model) && !Object.values(IMAGE_MODEL_ALIASES).includes(model)) {
-    model = "gemini-2.5-flash-image";
+  if (!modelData.imageModelIds.includes(primaryModel) && !Object.values(IMAGE_MODEL_ALIASES).includes(primaryModel)) {
+    primaryModel = "black-forest-labs/flux-2-klein-4b";
   }
-  c.set("model", model);
+  c.set("model", primaryModel);
 
   const promptObject: Record<string, unknown> = {
     prompt: body.prompt,
@@ -78,39 +86,90 @@ app.post("/v1/images/generations", async (c) => {
   if (body.output_format) promptObject.output_format = body.output_format;
   if (body.output_quality) promptObject.output_quality = body.output_quality;
 
-  const payload = {
-    type: "IMAGE_GENERATOR",
-    model,
-    promptObject,
-  };
+  const candidateModels = [
+    primaryModel,
+    ...RESILIENT_FALLBACKS.filter((m) => m !== primaryModel),
+  ];
 
-  try {
-    const data = await callFeature(apiKey, payload);
-    const resultObj = data.aiRecord?.aiRecordDetail?.resultObject;
+  let data: any = null;
+  let lastError: unknown = null;
 
-    let urls: string[] = [];
+  for (const modelToTry of candidateModels) {
+    try {
+      const payload = {
+        type: "IMAGE_GENERATOR",
+        model: modelToTry,
+        promptObject,
+      };
+      data = await callFeature(apiKey, payload);
+      if (data?.aiRecord?.status === "SUCCESS" || data?.aiRecord?.temporaryUrl || data?.aiRecord?.aiRecordDetail?.resultObject) {
+        c.set("model", modelToTry);
+        break;
+      }
+    } catch (err) {
+      lastError = err;
+      console.warn(`Image generation failed for ${modelToTry}, attempting fallback...`, (err as Error).message);
+    }
+  }
+
+  if (!data) {
+    console.error("All image generation model attempts failed:", lastError);
+    throw lastError;
+  }
+
+  // Extract temporary signed S3 URL or resultObject
+  const rawAiRecord = data.aiRecord as any;
+  let urls: string[] = [];
+
+  if (rawAiRecord?.temporaryUrl && typeof rawAiRecord.temporaryUrl === "string") {
+    urls.push(rawAiRecord.temporaryUrl);
+  } else if (Array.isArray(rawAiRecord?.temporaryUrls)) {
+    urls.push(...rawAiRecord.temporaryUrls.filter((u: unknown) => typeof u === "string"));
+  }
+
+  if (urls.length === 0) {
+    const resultObj = rawAiRecord?.aiRecordDetail?.resultObject;
     if (Array.isArray(resultObj)) {
       urls = resultObj.filter((u): u is string => typeof u === "string");
     } else if (typeof resultObj === "string") {
       urls = [resultObj];
     }
-
-    // Fix relative image paths from 1min.ai
-    const ONEMIN_BASE = "https://api.1min.ai/";
-    const resolvedUrls = urls.map((url) =>
-      url.startsWith("http") ? url : `${ONEMIN_BASE}${url}`,
-    );
-
-    const response: ImageGenerationResponse = {
-      created: Math.floor(Date.now() / 1000),
-      data: resolvedUrls.map((url) => ({ url })),
-    };
-
-    return c.json(response);
-  } catch (err) {
-    console.error("Image generation error:", err);
-    throw err;
   }
+
+  const S3_BASE = "https://s3.us-east-1.amazonaws.com/asset.1min.ai/";
+  const resolvedUrls = urls.map((url) => {
+    if (url.startsWith("http://") || url.startsWith("https://")) {
+      return url;
+    }
+    return `${S3_BASE}${url.replace(/^\/+/, "")}`;
+  });
+
+  const isB64Requested = body.response_format === "b64_json";
+
+  const imageItems = await Promise.all(
+    resolvedUrls.map(async (url) => {
+      if (isB64Requested) {
+        try {
+          const imgRes = await fetch(url);
+          if (imgRes.ok) {
+            const arrBuf = await imgRes.arrayBuffer();
+            const b64 = Buffer.from(arrBuf).toString("base64");
+            return { b64_json: b64, url };
+          }
+        } catch (err) {
+          console.error("Failed to convert image to b64_json:", err);
+        }
+      }
+      return { url };
+    }),
+  );
+
+  const response: ImageGenerationResponse = {
+    created: Math.floor(Date.now() / 1000),
+    data: imageItems,
+  };
+
+  return c.json(response);
 });
 
 export default app;
