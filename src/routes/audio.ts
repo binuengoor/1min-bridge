@@ -92,6 +92,8 @@ app.post("/v1/audio/transcriptions", async (c) => {
 
   const responseFormat =
     (formData.get("response_format") as string) || "json";
+  const model = (formData.get("model") as string) || "whisper-1";
+  c.set("model", model);
 
   const text = await handleAudioRequest(apiKey, formData, "SPEECH_TO_TEXT");
 
@@ -123,6 +125,8 @@ app.post("/v1/audio/translations", async (c) => {
 
   const responseFormat =
     (formData.get("response_format") as string) || "json";
+  const model = (formData.get("model") as string) || "whisper-1";
+  c.set("model", model);
 
   const text = await handleAudioRequest(apiKey, formData, "AUDIO_TRANSLATOR");
 
@@ -161,6 +165,7 @@ app.post("/v1/audio/speech", async (c) => {
   }
 
   const { model, input, voice, response_format, speed, speakingRate, pitch, languageCode, voice_settings } = body;
+  c.set("model", model);
 
   let modelForApi = model;
   let promptObject: Record<string, unknown> = {};

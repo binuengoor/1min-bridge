@@ -548,6 +548,8 @@ app.post("/v1/chat/completions", async (c) => {
   }
 
   const prompt = formatMessagesFor1Min(finalMessages);
+  c.set("model", cleanModel);
+  c.set("promptTokens", calculateTokens(prompt));
 
   const payload = {
     type: resolvedFeatureType,

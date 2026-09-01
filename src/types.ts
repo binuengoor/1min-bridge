@@ -507,5 +507,9 @@ export type Env = {
   Variables: {
     oneMinApiKey: string;
     gatewayToken?: string;
+    model?: string;
+    promptTokens?: number;
+    completionTokens?: number;
+    credits?: number;
   };
 };

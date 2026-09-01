@@ -291,6 +291,8 @@ app.post("/v1/messages", async (c) => {
   }
 
   const prompt = formatMessagesFor1Min(internalMessages);
+  c.set("model", cleanModel);
+  c.set("promptTokens", calculateTokens(prompt));
   const messageId = `msg_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
 
   const payload = {

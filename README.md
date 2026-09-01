@@ -28,6 +28,7 @@ Universal, self-hosted and edge-native AI Gateway for [1min.ai](https://1min.ai)
 - **📚 RAG & Memory Unpacker** — Unrolls LangChain / Vector Store document JSONs (`pageContent`, metadata timestamps) into clean human-readable context blocks.
 - **🌐 Web Hub & Native Search** — Append `:online` to any model ID for 1min.ai native web search. Dedicated `POST /v1/web/fetch` (via Jina Reader) and `POST /v1/search` (via SearXNG).
 - **🔢 Accurate Token Estimation** — Integrated `gpt-tokenizer` for accurate BPE token counts on prompts, completions, and streaming headers.
+- **📊 Interactive Web Dashboard & Dual-Metric Analytics** — Zero-dependency web UI at `/dashboard` with live request & credit breakdowns (toggle between **Request Count** and **Credits Consumed**), real-time check-in log, wallet balance, and manual check-in trigger.
 - **🎁 Resilient Automated Daily Check-in (+15,000 credits/day)** — Built-in background engine that claims the 15,000 daily check-in bonus directly via `api.1min.ai` authentication. Immune to UI/popups/DOM changes, supports RFC 6238 TOTP 2FA, configurable schedules with jitter, and Telegram/Webhook alerts.
 - **☁️ Universal Dual-Runtime** — Deploy anywhere:
   - **Docker / Node.js:** Self-hosted standalone container with graceful draining and Prometheus metrics.
@@ -40,6 +41,8 @@ Universal, self-hosted and edge-native AI Gateway for [1min.ai](https://1min.ai)
 
 | Method | Endpoint | Standard | Description |
 |---|---|---|---|
+| `GET` | `/dashboard` (or `/stats`) | Gateway | Interactive visual Web Dashboard (Request & Credit analytics) |
+| `GET` | `/api/stats` | Gateway | Aggregated stats JSON API (models, endpoints, recent requests) |
 | `GET` | `/health` | Gateway | Health check & model registry statistics |
 | `GET` | `/v1/checkin/status` | Gateway | Check-in status, credit balance, last run result, and history |
 | `POST` | `/v1/checkin/run` | Gateway | Manual on-demand check-in trigger |
@@ -234,6 +237,17 @@ Trigger an immediate manual check-in:
 ```bash
 curl -X POST http://localhost:3000/v1/checkin/run
 ```
+
+### 4. Live Visual Dashboard & Analytics
+
+Open in your browser:
+```
+http://localhost:3000/dashboard
+```
+
+- **Dual-Metric Toggle**: Switch on the fly between **🔢 Request Count** and **💳 Credits Consumed**.
+- **Live Logs**: Watch the last 20 requests with HTTP status, latency, tokens, and credit cost.
+- **Credit Log**: View the last 10 daily check-in rewards (`+15,000 credits`) and trigger manual check-ins with one click.
 
 ---
 

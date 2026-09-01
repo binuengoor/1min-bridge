@@ -41,6 +41,7 @@ app.post("/v1/images/generations", async (c) => {
   }
 
   const model = body.model ?? "flux-schnell";
+  c.set("model", model);
   const modelData = await getModelData();
 
   if (!modelData.imageModelIds.includes(model)) {

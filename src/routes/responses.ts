@@ -171,6 +171,9 @@ app.post("/v1/responses", async (c) => {
     body.reasoning_effort,
   );
 
+  c.set("model", cleanModel);
+  c.set("promptTokens", calculateTokens(prompt));
+
   const responseId = newResponseId();
   const created = nowSec();
 

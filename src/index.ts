@@ -23,7 +23,10 @@ import docsRoutes from "./routes/docs.js";
 import youtubeRoutes from "./routes/youtube.js";
 import metricsRoutes from "./routes/metrics.js";
 import checkinRoutes from "./routes/checkin.js";
+import dashboardRoutes from "./routes/dashboard.js";
 import { getCheckinScheduler } from "./checkin/scheduler.js";
+import { statsTracker } from "./stats.js";
+import { calculateCredits } from "./utils/credits.js";
 
 const app = new Hono<Env>();
 
@@ -112,6 +115,37 @@ app.use("*", async (c, next) => {
       { method: c.req.method, path: c.req.path },
       ms / 1000,
     );
+
+    // Record stats (skip internal polling endpoints)
+    const reqPath = c.req.path;
+    if (
+      reqPath !== "/api/stats" &&
+      reqPath !== "/dashboard" &&
+      reqPath !== "/stats" &&
+      reqPath !== "/health" &&
+      reqPath !== "/v1/metrics"
+    ) {
+      let credits = c.get("credits");
+      const model = c.get("model");
+      const promptTokens = c.get("promptTokens");
+      const completionTokens = c.get("completionTokens");
+
+      if (credits === undefined && model) {
+        credits = await calculateCredits(model, promptTokens, completionTokens);
+      }
+
+      statsTracker.recordRequest({
+        method: c.req.method,
+        path: reqPath,
+        model,
+        status: c.res.status,
+        durationMs: ms,
+        promptTokens,
+        completionTokens,
+        credits: credits ?? 0,
+        requestId,
+      });
+    }
   }
 });
 
@@ -150,6 +184,7 @@ app.route("/", modelRoutes);
 app.route("/", docsRoutes);
 app.route("/", metricsRoutes);
 app.route("/", checkinRoutes);
+app.route("/", dashboardRoutes);
 
 // ---------------------------------------------------------------------------
 // Protected routes (auth + rate limit)

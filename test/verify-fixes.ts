@@ -260,6 +260,37 @@ Tool: [{"result": "ok"}]`;
   assert.strictEqual(aliasStatusRes.status, 200);
   console.log("  ✅ Check-in status endpoints verified.\n");
 
+  // --------------------------------------------------------------------------
+  // Test 10: Credit Calculations, Stats API & Web Dashboard
+  // --------------------------------------------------------------------------
+  console.log("Test 10: Credit Calculations & Web Dashboard...");
+  const { calculateCredits } = await import("../src/utils/credits.js");
+  const { statsTracker } = await import("../src/stats.js");
+
+  const estCredits = await calculateCredits("gpt-4o", 500, 200);
+  assert.ok(estCredits > 0, "Calculated credits should be positive");
+
+  statsTracker.recordRequest({
+    method: "POST",
+    path: "/v1/chat/completions",
+    model: "gpt-4o",
+    status: 200,
+    durationMs: 250,
+    credits: estCredits,
+  });
+
+  const apiStatsRes = await app.fetch(new Request("http://localhost:3000/api/stats"));
+  assert.strictEqual(apiStatsRes.status, 200);
+  const statsPayload = await apiStatsRes.json();
+  assert.ok(statsPayload.totalRequests > 0);
+
+  const dashHtmlRes = await app.fetch(new Request("http://localhost:3000/dashboard"));
+  assert.strictEqual(dashHtmlRes.status, 200);
+  const dashHtml = await dashHtmlRes.text();
+  assert.ok(dashHtml.includes("1min-bridge Live Dashboard"));
+  assert.ok(dashHtml.includes("tab-credits"));
+  console.log("  ✅ Credit calculations and live Web Dashboard verified.\n");
+
   console.log("🎉 ALL VERIFICATION TESTS PASSED SUCCESSFULLY!\n");
   process.exit(0);
 }
