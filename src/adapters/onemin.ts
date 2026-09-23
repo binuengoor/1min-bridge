@@ -10,6 +10,7 @@ import type {
   OneMinAssetResponse,
 } from "../types.js";
 import { upstreamError } from "../errors.js";
+import { ResponseSanitizer } from "./sanitizer.js";
 
 const FETCH_TIMEOUT_MS = 120_000; // 2 min for generation requests
 const UPLOAD_TIMEOUT_MS = 30_000; // 30s for asset uploads
@@ -126,6 +127,12 @@ export async function callChatStream(
               }
 
               if (textChunk) {
+                // Drop ephemeral 1min.ai search / crawling status banners
+                if (ResponseSanitizer.isCrawlingStatus(textChunk)) {
+                  currentEvent = "";
+                  continue;
+                }
+
                 controller.enqueue(
                   encoder.encode(`data: ${JSON.stringify(textChunk)}\n\n`),
                 );

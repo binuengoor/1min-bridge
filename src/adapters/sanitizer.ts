@@ -6,6 +6,17 @@ export class ResponseSanitizer {
   static readonly MAX_MEMORY_CHARS = 8000;
 
   /**
+   * Detects ephemeral 1min.ai crawling / search progress status banners.
+   */
+  static isCrawlingStatus(text: string): boolean {
+    if (!text || typeof text !== "string") return false;
+    const trimmed = text.trim();
+    return /^(?:🌐|🔍|🔑)\s*(?:Crawling|Searching|Doing Google search|Extracting keywords)/i.test(
+      trimmed,
+    );
+  }
+
+  /**
    * Strips tool-call JSON/XML blocks, returning the prose remainder.
    * Used to preserve user-facing text that precedes tool JSON in streams.
    */
@@ -68,15 +79,19 @@ export class ResponseSanitizer {
 
     // 5. Remove search / crawling status introductions
     cleaned = cleaned.replace(
-      /^(?:Okay|Ok|Certo|Entendido|Sure)[^.\n]*?(?:procurar|pesquisar|buscar|search|crawling)[^.\n]*?\.\s*/gim,
+      /^(?:Okay|Ok|Certo|Entendido|Sure)[^.\n]*?(?:procurar|pesquisar|buscar|search|crawling)[^\n]*\n?/gim,
       "",
     );
     cleaned = cleaned.replace(
-      /^(?:🌐\s*)?(?:Crawling|Searching)(?: the web| for| site)?[^.\n]*[.\n]/gim,
+      /^(?:🌐|🔍|🔑)\s*(?:Crawling|Searching|Doing Google search|Extracting keywords)[^\n]*\n?/gim,
       "",
     );
     cleaned = cleaned.replace(
-      /^Let me (?:search|look up|check)[^.\n]*[.\n]/gim,
+      /^(?:Crawling|Searching)(?: the web| for| site)?[^\n]*\n?/gim,
+      "",
+    );
+    cleaned = cleaned.replace(
+      /^Let me (?:search|look up|check)[^\n]*\n?/gim,
       "",
     );
 

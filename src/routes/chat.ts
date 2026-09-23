@@ -296,7 +296,7 @@ function buildStreamingResponse(
         let pendingContentBuffer = "";
 
         const flushContent = (text: string) => {
-          if (!text) return;
+          if (!text || ResponseSanitizer.isCrawlingStatus(text)) return;
           const sseChunk: ChatCompletionChunk = {
             id: chatId,
             object: "chat.completion.chunk",

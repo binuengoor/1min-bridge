@@ -108,10 +108,17 @@ I need to check the weather for New York. Let me call get_weather.
 
   // Sanitizer cleanup
   const dirtyOutput = `<think>Internal thinking...</think>
+🌐 Crawling site https://en.wikipedia.org/wiki/Real_Madrid_CF
+🔍 Doing Google search with keyword: Real Madrid CF
+🔑 Extracting keywords
 Assistant: The current weather in New York is sunny and 22°C.
 Tool: [{"result": "ok"}]`;
   const cleanOutput = ResponseSanitizer.cleanOutput(dirtyOutput);
   assert.strictEqual(cleanOutput, "The current weather in New York is sunny and 22°C.");
+  assert.strictEqual(
+    ResponseSanitizer.isCrawlingStatus("🌐 Crawling site https://en.wikipedia.org/wiki/Real_Madrid_CF"),
+    true,
+  );
 
   // Memory unpacker
   const langchainDoc = {

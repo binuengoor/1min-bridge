@@ -408,7 +408,7 @@ app.post("/v1/messages", async (c) => {
                     textChunk = trimmed;
                   }
 
-                  if (textChunk) {
+                  if (textChunk && !ResponseSanitizer.isCrawlingStatus(textChunk)) {
                     fullContent += textChunk;
 
                     if (!hasTools) {
