@@ -19,6 +19,7 @@ import {
   ToolCallingEmulator,
   type ToolDefinition,
 } from "../adapters/tool-emulator.js";
+import { parseToolCalls } from "../adapters/tool-parser.js";
 import { ResponseSanitizer } from "../adapters/sanitizer.js";
 import { calculateTokens } from "../utils/tokens.js";
 import type {
@@ -28,6 +29,7 @@ import type {
   ChatCompletionChunk,
   ChatMessage,
   ChatContentPart,
+  OneMinRequestBody,
 } from "../types.js";
 
 const app = new Hono<Env>();
@@ -37,9 +39,9 @@ const app = new Hono<Env>();
 // ---------------------------------------------------------------------------
 
 const FEATURE_SUFFIX_MAP: Record<string, string> = {
-  ":pdf": "CHAT_WITH_PDF",
-  ":summarize": "SUMMARIZER",
-  ":code": "CODE_GENERATOR",
+  ":pdf": "UNIFY_CHAT_WITH_AI",
+  ":summarize": "UNIFY_CHAT_WITH_AI",
+  ":code": "UNIFY_CHAT_WITH_AI",
   ":online": "UNIFY_CHAT_WITH_AI", // special: triggers webSearch flag
 };
 
@@ -48,10 +50,14 @@ function resolveFeatureType(modelName: string): {
   cleanModel: string;
   webSearch: boolean;
 } {
-  for (const [suffix, featureType] of Object.entries(FEATURE_SUFFIX_MAP)) {
+  for (const suffix of Object.keys(FEATURE_SUFFIX_MAP)) {
     if (modelName.endsWith(suffix)) {
       return {
-        featureType: suffix === ":online" ? "UNIFY_CHAT_WITH_AI" : featureType,
+        // All suffixes now resolve to UNIFY_CHAT_WITH_AI per 1min.ai migration
+        // guide (legacy CHAT_WITH_PDF / SUMMARIZER / CODE_GENERATOR are
+        // deprecated on /api/chat-with-ai). PDFs/files ride via
+        // promptObject.attachments.files; :online toggles webSearchSettings.
+        featureType: "UNIFY_CHAT_WITH_AI",
         cleanModel: modelName.slice(0, -suffix.length),
         webSearch: suffix === ":online",
       };
@@ -141,6 +147,13 @@ const chatRequestSchema = z.object({
   user: z.string().optional(),
   tools: z.array(toolSchema).optional(),
   tool_choice: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
+  // Upstream 1min.ai passthrough (nested promptObject.settings per Chat with AI API)
+  brandVoiceId: z.string().optional(),
+  withMemories: z.boolean().optional(),
+  numOfSite: z.number().int().min(1).max(10).optional(),
+  maxWord: z.number().int().min(100).max(10000).optional(),
+  historyMessageLimit: z.number().int().min(1).max(50).optional(),
+  conversationId: z.string().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -154,8 +167,8 @@ function formatMessagesFor1Min(messages: ChatMessage[]): string {
     if (m.role === "tool" || m.role === "function") {
       const cleanContent = ResponseSanitizer.unpackMemoryContent(m.content);
       const prefix = m.tool_call_id
-        ? `[Contexto do Sistema - Informação Recuperada para ${m.tool_call_id}]:`
-        : `[Contexto do Sistema - Informação Recuperada]:`;
+        ? `[System Context - Retrieved Tool Result for ${m.tool_call_id}]:`
+        : `[System Context - Retrieved Tool Result]:`;
       parts.push(`${prefix}\n${cleanContent}`);
       continue;
     }
@@ -174,7 +187,7 @@ function formatMessagesFor1Min(messages: ChatMessage[]): string {
           return `${fnName}(${argsStr})`;
         })
         .join(", ");
-      parts.push(`[Assistente consultou: ${callsStr}]`);
+      parts.push(`[Assistant called tool: ${callsStr}]`);
       continue;
     }
 
@@ -362,10 +375,12 @@ function buildStreamingResponse(
 
                 if (hasTools) {
                   pendingContentBuffer += content;
-                  if (!ToolCallingEmulator.isPotentialToolCallBuffer(pendingContentBuffer)) {
-                    flushContent(pendingContentBuffer);
-                    pendingContentBuffer = "";
-                  }
+                  // Flush safe prose prefix immediately; retain only the
+                  // suffix that may be an incomplete tool-call block.
+                  const [safeProse, retained] =
+                    ToolCallingEmulator.splitSafeProse(pendingContentBuffer);
+                  if (safeProse) flushContent(safeProse);
+                  pendingContentBuffer = retained;
                 } else {
                   flushContent(content);
                 }
@@ -384,10 +399,10 @@ function buildStreamingResponse(
                 fullContent += text;
                 if (hasTools) {
                   pendingContentBuffer += text;
-                  if (!ToolCallingEmulator.isPotentialToolCallBuffer(pendingContentBuffer)) {
-                    flushContent(pendingContentBuffer);
-                    pendingContentBuffer = "";
-                  }
+                  const [safeProse, retained] =
+                    ToolCallingEmulator.splitSafeProse(pendingContentBuffer);
+                  if (safeProse) flushContent(safeProse);
+                  pendingContentBuffer = retained;
                 } else {
                   flushContent(text);
                 }
@@ -395,29 +410,54 @@ function buildStreamingResponse(
             }
           }
 
-          // Check for tool calls in full accumulated content
-          const toolCalls = ToolCallingEmulator.parseResponse(fullContent, allowedTools);
+          // Check for tool calls in full accumulated content (primary +
+          // Mistral/Qwen/XML fallback formats)
+          const toolCalls = hasTools
+            ? ToolCallingEmulator.parseResponseWithFallback(
+                fullContent,
+                allowedTools,
+                (t) => parseToolCalls(t),
+              )
+            : null;
           const hasToolCalls = toolCalls !== null && toolCalls.length > 0;
 
-          if (hasToolCalls) {
-            const toolCallChunk: ChatCompletionChunk = {
-              id: chatId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    tool_calls: ToolCallingEmulator.formatStreamingToolCalls(toolCalls),
-                  },
-                  finish_reason: "tool_calls",
-                },
-              ],
-            };
-            controller.enqueue(
-              encoder.encode(`data: ${JSON.stringify(toolCallChunk)}\n\n`),
+          if (hasToolCalls && toolCalls) {
+            // Emit any prose that preceded the tool JSON (stripped of tool
+            // blocks) so it is not swallowed, then progressive tool deltas.
+            const proseRemainder = ResponseSanitizer.cleanOutput(
+              ResponseSanitizer.stripToolJson(fullContent),
             );
+            if (proseRemainder) flushContent(proseRemainder);
+
+            const deltas =
+              ToolCallingEmulator.formatProgressiveToolCallDeltas(toolCalls);
+            for (const d of deltas) {
+              const toolDeltaChunk: ChatCompletionChunk = {
+                id: chatId,
+                object: "chat.completion.chunk",
+                created,
+                model,
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: d.index,
+                          ...(d.id ? { id: d.id } : {}),
+                          type: "function",
+                          function: { ...d.function },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              };
+              controller.enqueue(
+                encoder.encode(`data: ${JSON.stringify(toolDeltaChunk)}\n\n`),
+              );
+            }
           } else if (pendingContentBuffer) {
             const cleaned = ResponseSanitizer.cleanOutput(pendingContentBuffer);
             if (cleaned) {
@@ -505,10 +545,8 @@ app.post("/v1/chat/completions", async (c) => {
 
   const { messages, stream, tools, tool_choice } = body;
 
-  // Resolve feature type from model suffix (e.g. gpt-4o:pdf, gpt-4o:online)
-  const { featureType, cleanModel, webSearch } = resolveFeatureType(
-    body.model,
-  );
+  // Resolve model suffix (e.g. gpt-4o:pdf, gpt-4o:online) — all map to UNIFY
+  const { cleanModel, webSearch } = resolveFeatureType(body.model);
 
   // Validate model exists and is a chat model
   const modelData = await getModelData();
@@ -516,10 +554,10 @@ app.post("/v1/chat/completions", async (c) => {
     return sendError(c, modelNotFoundError(body.model));
   }
 
-  // Handle vision — overrides feature type if images present
+  // Handle vision — attachments.images on UNIFY_CHAT_WITH_AI (per migration guide)
   const isVision = hasImageContent(messages);
   let imageList: string[] = [];
-  let resolvedFeatureType = featureType;
+  const resolvedFeatureType = "UNIFY_CHAT_WITH_AI";
 
   if (isVision) {
     if (!(await isVisionModel(cleanModel))) {
@@ -531,7 +569,6 @@ app.post("/v1/chat/completions", async (c) => {
         ),
       );
     }
-    resolvedFeatureType = "CHAT_WITH_IMAGE";
     imageList = await extractImageUrls(apiKey, messages);
   }
 
@@ -550,14 +587,42 @@ app.post("/v1/chat/completions", async (c) => {
   c.set("model", cleanModel);
   c.set("promptTokens", calculateTokens(prompt));
 
-  const payload = {
+  const extra = body as unknown as Record<string, unknown>;
+  const numOfSite =
+    typeof extra.numOfSite === "number" ? extra.numOfSite : undefined;
+  const maxWord =
+    typeof extra.maxWord === "number" ? extra.maxWord : undefined;
+  const historyMessageLimit =
+    typeof extra.historyMessageLimit === "number"
+      ? extra.historyMessageLimit
+      : undefined;
+  const withMemories =
+    typeof extra.withMemories === "boolean" ? extra.withMemories : undefined;
+  const brandVoiceId =
+    typeof extra.brandVoiceId === "string" ? extra.brandVoiceId : undefined;
+  const conversationId =
+    typeof extra.conversationId === "string" ? extra.conversationId : undefined;
+
+  const payload: OneMinRequestBody = {
     type: resolvedFeatureType,
     model: cleanModel,
+    ...(brandVoiceId ? { brandVoiceId } : {}),
     promptObject: {
       prompt,
-      isMixed: false,
-      webSearch,
-      ...(imageList.length > 0 ? { imageList } : {}),
+      ...(conversationId ? { conversationId } : {}),
+      settings: {
+        webSearchSettings: {
+          webSearch,
+          ...(numOfSite !== undefined ? { numOfSite } : {}),
+          ...(maxWord !== undefined ? { maxWord } : {}),
+        },
+        historySettings: {
+          isMixed: false,
+          ...(historyMessageLimit !== undefined ? { historyMessageLimit } : {}),
+        },
+        ...(withMemories !== undefined ? { withMemories } : {}),
+      },
+      ...(imageList.length > 0 ? { attachments: { images: imageList } } : {}),
       ...(body.max_tokens || body.max_completion_tokens
         ? { maxTokens: body.max_tokens ?? body.max_completion_tokens }
         : {}),
@@ -602,9 +667,13 @@ app.post("/v1/chat/completions", async (c) => {
       rawContent = JSON.stringify(resultObj);
     }
 
-    // Parse tool calls
+    // Parse tool calls (primary + Mistral/Qwen/XML fallback)
     const toolCalls = hasTools
-      ? ToolCallingEmulator.parseResponse(rawContent, tools as ToolDefinition[])
+      ? ToolCallingEmulator.parseResponseWithFallback(
+          rawContent,
+          tools as ToolDefinition[],
+          (t) => parseToolCalls(t),
+        )
       : null;
 
     const finishReason =

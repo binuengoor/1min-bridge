@@ -17,6 +17,7 @@ import type {
   Env,
   ResponseRequest,
   ResponsesAPIResponse,
+  OneMinRequestBody,
 } from "../types.js";
 
 const app = new Hono<Env>();
@@ -53,6 +54,13 @@ const responsesRequestSchema = z.object({
   stream: z.boolean().optional().default(false),
   temperature: z.number().optional(),
   max_output_tokens: z.number().int().positive().optional(),
+  // Upstream 1min.ai passthrough (nested promptObject.settings)
+  brandVoiceId: z.string().optional(),
+  withMemories: z.boolean().optional(),
+  numOfSite: z.number().int().min(1).max(10).optional(),
+  maxWord: z.number().int().min(100).max(10000).optional(),
+  historyMessageLimit: z.number().int().min(1).max(50).optional(),
+  conversationId: z.string().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -177,13 +185,28 @@ app.post("/v1/responses", async (c) => {
   const responseId = newResponseId();
   const created = nowSec();
 
-  const payload = {
+  const rExtra = body as unknown as Record<string, unknown>;
+  const payload: OneMinRequestBody = {
     type: "UNIFY_CHAT_WITH_AI",
     model: cleanModel,
+    ...(typeof rExtra.brandVoiceId === "string" ? { brandVoiceId: rExtra.brandVoiceId } : {}),
     promptObject: {
       prompt,
-      isMixed: false,
-      webSearch,
+      ...(typeof rExtra.conversationId === "string" ? { conversationId: rExtra.conversationId } : {}),
+      settings: {
+        webSearchSettings: {
+          webSearch,
+          ...(typeof rExtra.numOfSite === "number" ? { numOfSite: rExtra.numOfSite } : {}),
+          ...(typeof rExtra.maxWord === "number" ? { maxWord: rExtra.maxWord } : {}),
+        },
+        historySettings: {
+          isMixed: false,
+          ...(typeof rExtra.historyMessageLimit === "number"
+            ? { historyMessageLimit: rExtra.historyMessageLimit }
+            : {}),
+        },
+        ...(typeof rExtra.withMemories === "boolean" ? { withMemories: rExtra.withMemories } : {}),
+      },
       ...(body.max_output_tokens ? { maxTokens: body.max_output_tokens } : {}),
     },
   };

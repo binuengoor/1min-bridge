@@ -7,7 +7,7 @@ import { generateTotp } from "./totp.js";
 import type { CheckinResult } from "../types.js";
 
 const DEFAULT_TIMEOUT_MS = 15_000;
-const CHECKIN_SETTLE_MS = 3_000;
+const DEFAULT_SETTLE_MS = 3_000;
 const MAX_RETRIES = 3;
 const RETRY_BASE_DELAY_MS = 2_000;
 
@@ -19,6 +19,7 @@ export interface CheckinClientOptions {
   password?: string;
   totpSecret?: string;
   timeoutMs?: number;
+  settleMs?: number;
   baseUrl?: string;
 }
 
@@ -28,6 +29,7 @@ export class OneMinCheckinClient {
   private totpSecret?: string;
   private deviceId: string;
   private timeoutMs: number;
+  private settleMs: number;
   private baseUrl: string;
 
   constructor(options: CheckinClientOptions = {}) {
@@ -35,6 +37,7 @@ export class OneMinCheckinClient {
     this.password = options.password;
     this.totpSecret = options.totpSecret ? options.totpSecret.trim() : undefined;
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.settleMs = options.settleMs ?? DEFAULT_SETTLE_MS;
     this.baseUrl = options.baseUrl ?? "https://api.1min.ai";
     this.deviceId = this.generateDeviceId();
   }
@@ -216,7 +219,7 @@ export class OneMinCheckinClient {
     await this.checkUnreadNotifications(headers);
 
     // 5. Wait for check-in bonus reward to settle
-    await new Promise((resolve) => setTimeout(resolve, CHECKIN_SETTLE_MS));
+    await new Promise((resolve) => setTimeout(resolve, this.settleMs));
 
     // 6. Fetch final credits from team credits endpoint
     let finalCredit = initialCredit;

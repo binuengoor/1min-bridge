@@ -8,6 +8,10 @@ import type { Env } from "../types.js";
 
 const app = new Hono<Env>();
 
+const BOOT_TIME = Date.now();
+const VERSION = "0.1.0";
+const WORKER = typeof process !== "undefined" && process.versions?.node ? "node" : "edge";
+
 app.get("/", (c) => {
   return c.text(
     [
@@ -32,6 +36,9 @@ app.get("/health", async (c) => {
     const data = await getModelData();
     return c.json({
       status: "ok",
+      version: VERSION,
+      worker: WORKER,
+      uptimeSeconds: Math.floor((Date.now() - BOOT_TIME) / 1000),
       models: {
         chat: data.chatModelIds.length,
         image: data.imageModelIds.length,

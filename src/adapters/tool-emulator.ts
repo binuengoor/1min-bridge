@@ -353,17 +353,140 @@ Strict Tool Call Format:
     }));
   }
 
+  /**
+   * Builds OpenAI-spec progressive tool-call delta chunks: one starter chunk
+   * per tool (id+name+empty args), then ~64-char argument slices, leaving the
+   * terminal finish_reason to the caller (emit exactly one).
+   */
+  static formatProgressiveToolCallDeltas(
+    toolCalls: ToolCall[],
+    sliceSize = 64,
+  ): Array<{ index: number; id?: string; type?: "function"; function?: { name?: string; arguments?: string } }> {
+    const deltas: Array<{
+      index: number;
+      id?: string;
+      type?: "function";
+      function?: { name?: string; arguments?: string };
+    }> = [];
+    toolCalls.forEach((tc, index) => {
+      deltas.push({
+        index,
+        id: tc.id,
+        type: "function",
+        function: { name: tc.function.name, arguments: "" },
+      });
+      const args = tc.function.arguments ?? "";
+      for (let i = 0; i < args.length; i += sliceSize) {
+        deltas.push({
+          index,
+          function: { arguments: args.slice(i, i + sliceSize) },
+        });
+      }
+    });
+    return deltas;
+  }
+
+  /**
+   * Locates the earliest index where a tool-call JSON/XML block may start.
+   * Returns -1 when no marker is present (buffer is pure prose).
+   */
+  static findPotentialToolStart(buffer: string): number {
+    const markers = [
+      "```json",
+      "```",
+      '"tool_calls"',
+      "tool_calls",
+      '"function"',
+      "TOOL_CALL:",
+      "TOOL_CALL",
+      "[TOOL_CALLS]",
+      "✿FUNCTION✿",
+      "<tool_call",
+      "<functioncall",
+      '{"name"',
+      '{"function"',
+    ];
+    let earliest = -1;
+    for (const m of markers) {
+      const idx = buffer.indexOf(m);
+      if (idx !== -1 && (earliest === -1 || idx < earliest)) {
+        earliest = idx;
+      }
+    }
+    // Bare "{" only counts when followed by tool-ish keys nearby
+    const braceIdx = buffer.indexOf("{");
+    if (braceIdx !== -1) {
+      const window = buffer.slice(braceIdx, braceIdx + 200);
+      if (/\"(name|function|tool_calls|arguments)\"\s*:/.test(window)) {
+        if (earliest === -1 || braceIdx < earliest) earliest = braceIdx;
+      }
+    }
+    return earliest;
+  }
+
+  /**
+   * Splits a streaming buffer into safe prose prefix (flush immediately) and
+   * retained suffix (may be incomplete tool JSON). Returns [prose, retained].
+   */
+  static splitSafeProse(buffer: string): [string, string] {
+    const idx = ToolCallingEmulator.findPotentialToolStart(buffer);
+    if (idx === -1) return [buffer, ""];
+    if (idx === 0) return ["", buffer];
+    return [buffer.slice(0, idx), buffer.slice(idx)];
+  }
+
   static isPotentialToolCallBuffer(buffer: string): boolean {
-    const trimmed = buffer.trimStart();
-    const markers = ["{", "```", "tool_calls", '"tool_calls"', "TOOL_CALL"];
-    return markers.some((m) => trimmed.startsWith(m) || trimmed.includes(m));
+    if (!buffer || !buffer.trim()) return false;
+    // Complete tool JSON is handled at end-of-stream; while streaming we only
+    // hold back the suffix that could be an incomplete tool block.
+    const [, retained] = ToolCallingEmulator.splitSafeProse(buffer);
+    return retained.length > 0;
+  }
+
+  /**
+   * Primary parser with tool-parser.ts fallback (Mistral [TOOL_CALLS],
+   * Qwen ✿FUNCTION✿, TOOL_CALL: formats) when balanced-JSON finds nothing.
+   */
+  static parseResponseWithFallback(
+    content: string,
+    allowedTools?: ToolDefinition[],
+    fallback?: (text: string) => ToolCall[] | null,
+  ): ToolCall[] | null {
+    const primary = ToolCallingEmulator.parseResponse(content, allowedTools);
+    if (primary && primary.length > 0) return primary;
+    if (fallback) {
+      try {
+        const alt = fallback(content);
+        if (alt && alt.length > 0) {
+          if (!allowedTools || allowedTools.length === 0) return alt;
+          const names = new Set(
+            allowedTools
+              .map((t) => t.function?.name || t.name)
+              .filter((n): n is string => typeof n === "string"),
+          );
+          const filtered = alt.filter((tc) => names.has(tc.function.name));
+          return filtered.length > 0 ? filtered : null;
+        }
+      } catch {
+        // fall through to null
+      }
+    }
+    return null;
   }
 
   private static safeJsonParse(str: string): unknown {
     try {
       return JSON.parse(str);
     } catch {
-      return null;
+      // Minimal repair: strip trailing commas and JS-style comments
+      try {
+        const repaired = str
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .replace(/,\s*([}\]])/g, "$1");
+        return JSON.parse(repaired);
+      } catch {
+        return null;
+      }
     }
   }
 }

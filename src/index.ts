@@ -190,7 +190,10 @@ app.route("/", dashboardRoutes);
 // Protected routes (auth + rate limit)
 // ---------------------------------------------------------------------------
 
-const rateLimit = rateLimitMiddleware({ maxRequests: 60, windowMs: 60_000 });
+const rateLimit = rateLimitMiddleware({
+  maxRequests: config.rateLimitRpm,
+  windowMs: 60_000,
+});
 
 app.use("/v1/chat/*", authMiddleware, rateLimit);
 app.use("/v1/messages", authMiddleware, rateLimit);

@@ -35,6 +35,7 @@ export class CheckinScheduler {
       email: config.email,
       password: config.password,
       totpSecret: config.totpSecret,
+      settleMs: config.settleMs,
     });
   }
 
@@ -59,9 +60,10 @@ export class CheckinScheduler {
     );
 
     if (this.config.onStartup) {
-      // Delay slightly (5s) to allow main HTTP server and routes to bind first
+      // Delay slightly (5s) to allow main HTTP server and routes to bind first.
+      // Manual=true so the daily timer armed below is left untouched.
       setTimeout(() => {
-        this.runNow(false).catch((err) => {
+        this.runNow(true).catch((err) => {
           console.error("[Check-in Scheduler] Startup run failed:", err);
         });
       }, 5_000);
@@ -116,10 +118,8 @@ export class CheckinScheduler {
       return result;
     } finally {
       this.isExecuting = false;
-      // Re-schedule next run if this was triggered automatically
-      if (!manual) {
-        this.scheduleNextRun();
-      }
+      // Timer callback already re-arms via scheduleNextRun at fire time;
+      // do NOT re-schedule here to avoid double-arming/drift.
     }
   }
 
@@ -154,6 +154,8 @@ export class CheckinScheduler {
     );
 
     this.timer = setTimeout(() => {
+      // Re-arm first so the daily cadence survives slow/failed runs.
+      this.scheduleNextRun();
       this.runNow(false).catch((err) => {
         console.error("[Check-in Scheduler] Scheduled check-in error:", err);
       });

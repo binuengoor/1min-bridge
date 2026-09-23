@@ -40,6 +40,8 @@ export interface OneMinRequestBody {
   type: string;
   model: string;
   promptObject: Record<string, unknown>;
+  brandVoiceId?: string;
+  metadata?: Record<string, unknown>;
 }
 
 /** 1min.ai /api/features response (non-streaming) */
@@ -426,6 +428,7 @@ export interface AppConfig {
   oneMinModelsUrl: string;
   oneMinAssetUrl: string;
   cacheTtlMs: number;
+  rateLimitRpm: number;
   allowedModels?: string[];
   logLevel: "debug" | "info" | "warn" | "error";
   logFormat: "text" | "json";
@@ -447,6 +450,7 @@ export interface CheckinConfig {
   onStartup: boolean;
   utcHour: number; // 0-23 (default 8 UTC = 00:00 PST)
   jitterMinutes: number; // 0-30 (default 10)
+  settleMs: number; // wait for bonus settle before balance fetch (default 3000)
   telegramBotToken?: string;
   telegramChatId?: string;
   webhookUrl?: string;

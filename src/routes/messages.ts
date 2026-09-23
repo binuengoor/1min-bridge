@@ -15,6 +15,7 @@ import {
   ToolCallingEmulator,
   type ToolDefinition,
 } from "../adapters/tool-emulator.js";
+import { parseToolCalls } from "../adapters/tool-parser.js";
 import { ResponseSanitizer } from "../adapters/sanitizer.js";
 import { calculateTokens } from "../utils/tokens.js";
 import type {
@@ -23,6 +24,7 @@ import type {
   AnthropicMessageResponse,
   AnthropicContentBlock,
   ChatMessage,
+  OneMinRequestBody,
 } from "../types.js";
 
 const app = new Hono<Env>();
@@ -83,6 +85,13 @@ const anthropicRequestSchema = z.object({
   top_k: z.number().optional(),
   tools: z.array(anthropicToolSchema).optional(),
   tool_choice: z.union([z.string(), z.record(z.string(), z.unknown())]).optional(),
+  // Upstream 1min.ai passthrough (nested promptObject.settings)
+  brandVoiceId: z.string().optional(),
+  withMemories: z.boolean().optional(),
+  numOfSite: z.number().int().min(1).max(10).optional(),
+  maxWord: z.number().int().min(100).max(10000).optional(),
+  historyMessageLimit: z.number().int().min(1).max(50).optional(),
+  conversationId: z.string().optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -173,8 +182,8 @@ function formatMessagesFor1Min(messages: ChatMessage[]): string {
     if (m.role === "tool" || m.role === "function") {
       const cleanContent = ResponseSanitizer.unpackMemoryContent(m.content);
       const prefix = m.tool_call_id
-        ? `[Contexto do Sistema - Informação Recuperada para ${m.tool_call_id}]:`
-        : `[Contexto do Sistema - Informação Recuperada]:`;
+        ? `[System Context - Retrieved Tool Result for ${m.tool_call_id}]:`
+        : `[System Context - Retrieved Tool Result]:`;
       parts.push(`${prefix}\n${cleanContent}`);
       continue;
     }
@@ -193,7 +202,7 @@ function formatMessagesFor1Min(messages: ChatMessage[]): string {
           return `${fnName}(${argsStr})`;
         })
         .join(", ");
-      parts.push(`[Assistente consultou: ${callsStr}]`);
+      parts.push(`[Assistant called tool: ${callsStr}]`);
       continue;
     }
 
@@ -295,13 +304,28 @@ app.post("/v1/messages", async (c) => {
   c.set("promptTokens", calculateTokens(prompt));
   const messageId = `msg_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
 
-  const payload = {
+  const mExtra = body as unknown as Record<string, unknown>;
+  const payload: OneMinRequestBody = {
     type: "UNIFY_CHAT_WITH_AI",
     model: cleanModel,
+    ...(typeof mExtra.brandVoiceId === "string" ? { brandVoiceId: mExtra.brandVoiceId } : {}),
     promptObject: {
       prompt,
-      isMixed: false,
-      webSearch,
+      ...(typeof mExtra.conversationId === "string" ? { conversationId: mExtra.conversationId } : {}),
+      settings: {
+        webSearchSettings: {
+          webSearch,
+          ...(typeof mExtra.numOfSite === "number" ? { numOfSite: mExtra.numOfSite } : {}),
+          ...(typeof mExtra.maxWord === "number" ? { maxWord: mExtra.maxWord } : {}),
+        },
+        historySettings: {
+          isMixed: false,
+          ...(typeof mExtra.historyMessageLimit === "number"
+            ? { historyMessageLimit: mExtra.historyMessageLimit }
+            : {}),
+        },
+        ...(typeof mExtra.withMemories === "boolean" ? { withMemories: mExtra.withMemories } : {}),
+      },
       ...(body.max_tokens ? { maxTokens: body.max_tokens } : {}),
     },
   };
@@ -410,16 +434,19 @@ app.post("/v1/messages", async (c) => {
               // Process accumulated content for tools or sanitize text
               const outputTokens = calculateTokens(fullContent);
               const toolCalls = hasTools
-                ? ToolCallingEmulator.parseResponse(
+                ? ToolCallingEmulator.parseResponseWithFallback(
                     fullContent,
                     tools as unknown as ToolDefinition[],
+                    (t) => parseToolCalls(t),
                   )
                 : null;
 
               if (toolCalls && toolCalls.length > 0) {
                 for (let i = 0; i < toolCalls.length; i++) {
                   const tc = toolCalls[i]!;
-                  const toolUseId = tc.id.replace("call_", "toolu_");
+                  const toolUseId = tc.id.startsWith("toolu_")
+                    ? tc.id
+                    : `toolu_${tc.id.replace(/^call_/, "")}`;
 
                   let parsedArgs: Record<string, unknown> = {};
                   try {
@@ -439,14 +466,25 @@ app.post("/v1/messages", async (c) => {
                     },
                   });
 
-                  writeAnthropicSSE(controller, encoder, "content_block_delta", {
-                    type: "content_block_delta",
-                    index: i,
-                    delta: {
-                      type: "input_json_delta",
-                      partial_json: tc.function.arguments,
-                    },
-                  });
+                  const argStr = tc.function.arguments ?? "";
+                  if (argStr.length === 0) {
+                    writeAnthropicSSE(controller, encoder, "content_block_delta", {
+                      type: "content_block_delta",
+                      index: i,
+                      delta: { type: "input_json_delta", partial_json: "" },
+                    });
+                  } else {
+                    for (let s = 0; s < argStr.length; s += 64) {
+                      writeAnthropicSSE(controller, encoder, "content_block_delta", {
+                        type: "content_block_delta",
+                        index: i,
+                        delta: {
+                          type: "input_json_delta",
+                          partial_json: argStr.slice(s, s + 64),
+                        },
+                      });
+                    }
+                  }
 
                   writeAnthropicSSE(controller, encoder, "content_block_stop", {
                     type: "content_block_stop",
@@ -521,9 +559,10 @@ app.post("/v1/messages", async (c) => {
     }
 
     const toolCalls = hasTools
-      ? ToolCallingEmulator.parseResponse(
+      ? ToolCallingEmulator.parseResponseWithFallback(
           rawContent,
           tools as unknown as ToolDefinition[],
+          (t) => parseToolCalls(t),
         )
       : null;
 

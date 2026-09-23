@@ -23,6 +23,7 @@ const envSchema = z.object({
   ONE_MIN_MODELS_URL: z.string().url().default("https://api.1min.ai/models"),
   ONE_MIN_ASSET_URL: z.string().url().default("https://api.1min.ai/api/assets"),
   CACHE_TTL_MS: z.string().default("1800000"),
+  RATE_LIMIT_RPM: z.string().default("120"),
   ALLOWED_MODELS: z.string().optional(),
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default("info"),
   LOG_FORMAT: z.enum(["text", "json"]).default("text"),
@@ -37,6 +38,7 @@ const envSchema = z.object({
   CHECKIN_TELEGRAM_BOT_TOKEN: z.string().optional(),
   CHECKIN_TELEGRAM_CHAT_ID: z.string().optional(),
   CHECKIN_WEBHOOK_URL: z.string().optional(),
+  CHECKIN_SETTLE_MS: z.string().default("3000"),
 });
 
 function loadConfig(): AppConfig {
@@ -60,6 +62,7 @@ function loadConfig(): AppConfig {
     oneMinModelsUrl: env.ONE_MIN_MODELS_URL,
     oneMinAssetUrl: env.ONE_MIN_ASSET_URL,
     cacheTtlMs: parseInt(env.CACHE_TTL_MS, 10),
+    rateLimitRpm: parseInt(env.RATE_LIMIT_RPM, 10) || 120,
     allowedModels,
     logLevel: env.LOG_LEVEL,
     logFormat: env.LOG_FORMAT,
@@ -72,6 +75,7 @@ function loadConfig(): AppConfig {
       onStartup: env.CHECKIN_ON_STARTUP.toLowerCase() === "true" || env.CHECKIN_ON_STARTUP === "1",
       utcHour: parseInt(env.CHECKIN_UTC_HOUR, 10) || 8,
       jitterMinutes: parseInt(env.CHECKIN_JITTER_MINUTES, 10) || 10,
+      settleMs: parseInt(env.CHECKIN_SETTLE_MS, 10) || 3000,
       telegramBotToken: env.CHECKIN_TELEGRAM_BOT_TOKEN || undefined,
       telegramChatId: env.CHECKIN_TELEGRAM_CHAT_ID || undefined,
       webhookUrl: env.CHECKIN_WEBHOOK_URL || undefined,

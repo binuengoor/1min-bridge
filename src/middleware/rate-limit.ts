@@ -19,15 +19,17 @@ interface RateLimitOptions {
 
 const buckets = new Map<string, Bucket>();
 
-// Cleanup stale buckets every 5 minutes
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, bucket] of buckets) {
-    if (now - bucket.lastRefill > 600_000) {
-      buckets.delete(key);
+// Cleanup stale buckets every 5 minutes (no-op on edge runtimes)
+if (typeof setInterval !== "undefined") {
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, bucket] of buckets) {
+      if (now - bucket.lastRefill > 600_000) {
+        buckets.delete(key);
+      }
     }
-  }
-}, 300_000);
+  }, 300_000);
+}
 
 function getBucket(key: string, maxRequests: number, windowMs: number): Bucket {
   let bucket = buckets.get(key);

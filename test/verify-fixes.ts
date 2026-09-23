@@ -228,8 +228,15 @@ Tool: [{"result": "ok"}]`;
       }),
     }),
   );
-  // It shouldn't be 401 Unauthorized since x-api-key was provided
-  assert.notStrictEqual(authWithXApiKey.status, 401, "x-api-key authentication should be recognized");
+  // It shouldn't be rejected by *gateway* auth since x-api-key was provided.
+  // NOTE: upstream 401/502 (invalid mock key) proves gateway auth passed and
+  // the request reached 1min.ai — error passthrough preserves upstream status.
+  const xKeyBody = await authWithXApiKey.clone().json().catch(() => ({} as Record<string, unknown>));
+  const xKeyErr = (xKeyBody as { error?: { message?: string } }).error;
+  assert.ok(
+    !(authWithXApiKey.status === 401 && (xKeyErr?.message ?? "").includes("Missing API key")),
+    "x-api-key authentication should be recognized by gateway (must not fail with Missing API key)",
+  );
 
   console.log("  ✅ Protocol routes and multi-auth headers verified.\n");
 
