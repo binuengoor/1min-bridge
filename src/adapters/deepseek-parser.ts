@@ -109,7 +109,16 @@ export function parseDeepSeekToolCalls(text: string): ToolCall[] | null {
         }
       }
     }
-    toolCalls.push(makeToolCall(fnName, args));
+    if ((fnName === "tool_call" || fnName === "tool_calls") && Array.isArray(args.calls)) {
+      for (const nested of args.calls as Array<{ name?: string; arguments?: unknown; parameters?: unknown }>) {
+        if (nested && typeof nested === "object" && typeof nested.name === "string") {
+          const nestedArgs = nested.arguments ?? nested.parameters ?? {};
+          toolCalls.push(makeToolCall(nested.name, typeof nestedArgs === "object" && nestedArgs !== null ? nestedArgs as Record<string, unknown> : { value: nestedArgs }));
+        }
+      }
+    } else {
+      toolCalls.push(makeToolCall(fnName, args));
+    }
   }
   if (toolCalls.length > 0) return toolCalls;
 

@@ -165,6 +165,34 @@ I need to check the weather for New York. Let me call get_weather.
 <｜｜DSML｜｜ parameter name="name" string="true">homelab-ops</｜｜DSML｜｜ parameter>
 </｜｜DSML｜｜ invoke>`;
   assert.strictEqual(hasIncompleteDeepSeekToolCall(incompleteMultiInvoke), true, "Calls block still open despite invoke closed");
+  // Token fragmentation test: ensure partial prefixes like "<", "<｜", "<｜｜" are NOT flushed
+  const fragmentChunks = ["<", "｜", "｜", "DSML", "｜", "｜", " calls>\n"];
+  let pendingBuf = "";
+  const flushedChunks: string[] = [];
+  for (const ch of fragmentChunks) {
+    pendingBuf += ch;
+    const [safe, retained] = ToolCallingEmulator.splitSafeProse(pendingBuf);
+    if (safe) flushedChunks.push(safe);
+    pendingBuf = retained;
+  }
+  assert.strictEqual(flushedChunks.join(""), "", "No partial token fragments leaked during streaming");
+  assert.ok(pendingBuf.startsWith("<｜｜DSML｜｜ calls>"));
+
+  // Nested tool_call wrapper unpacking test
+  const nestedToolCallXml = `<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="read_file">
+<｜｜DSML｜｜ parameter name="path" string="true">/etc/hosts</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+<｜｜DSML｜｜ invoke name="tool_call">
+<｜｜DSML｜｜ parameter name="calls" string="false">[{"name": "memory_recall", "arguments": {"query": "test"}}]</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>`;
+  const parsedNestedXml = parseToolCalls(nestedToolCallXml);
+  assert.ok(parsedNestedXml, "Should parse nested tool_call wrapper");
+  assert.strictEqual(parsedNestedXml.length, 2);
+  assert.strictEqual(parsedNestedXml[0]!.function.name, "read_file");
+  assert.strictEqual(parsedNestedXml[1]!.function.name, "memory_recall");
+  assert.deepStrictEqual(JSON.parse(parsedNestedXml[1]!.function.arguments), { query: "test" });
 
   console.log("  ✅ ToolCallingEmulator and balanced JSON parsing verified.\n");
 

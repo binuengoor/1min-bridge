@@ -36,9 +36,14 @@ export interface ChatTool {
 }
 
 export function parseToolCalls(text: string): ToolCall[] | null {
+  // Pattern 1: DeepSeek DSML & Special Tokens (<｜｜DSML｜｜ ...> or <｜tool calls｜>...)
+  // Checked first because explicit XML markup may contain nested JSON arguments inside parameters.
+  const dsCalls = parseDeepSeekToolCalls(text);
+  if (dsCalls && dsCalls.length > 0) return dsCalls;
+
   const toolCalls: ToolCall[] = [];
 
-  // Pattern 1: TOOL_CALL: {...} format
+  // Pattern 2: TOOL_CALL: {...} format
   const toolCallPattern = /TOOL_CALL:\s*\{[^}]*"name"\s*:\s*"([^"]+)"[^}]*\}/g;
   let match: RegExpExecArray | null;
   while ((match = toolCallPattern.exec(text)) !== null) {
@@ -58,7 +63,7 @@ export function parseToolCalls(text: string): ToolCall[] | null {
   }
   if (toolCalls.length > 0) return toolCalls;
 
-  // Pattern 2: Standalone JSON with name + arguments
+  // Pattern 3: Standalone JSON with name + arguments
   const jsonPattern = /\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^}]*\})\s*\}/g;
   while ((match = jsonPattern.exec(text)) !== null) {
     try {
@@ -69,7 +74,7 @@ export function parseToolCalls(text: string): ToolCall[] | null {
   }
   if (toolCalls.length > 0) return toolCalls;
 
-  // Pattern 3: Mistral [TOOL_CALLS] [...]
+  // Pattern 4: Mistral [TOOL_CALLS] [...]
   const mistralPattern = /\[TOOL_CALLS\]\s*(\[.*?\])/gs;
   while ((match = mistralPattern.exec(text)) !== null) {
     try {
@@ -82,7 +87,7 @@ export function parseToolCalls(text: string): ToolCall[] | null {
   }
   if (toolCalls.length > 0) return toolCalls;
 
-  // Pattern 4: Qwen ✿FUNCTION✿ / ✿ARGS✿
+  // Pattern 5: Qwen ✿FUNCTION✿ / ✿ARGS✿
   const qwenPattern = /✿FUNCTION✿:\s*(\S+)\s*✿ARGS✿:\s*(\{.*?\})/gs;
   while ((match = qwenPattern.exec(text)) !== null) {
     try {
@@ -90,10 +95,6 @@ export function parseToolCalls(text: string): ToolCall[] | null {
     } catch { /* skip */ }
   }
   if (toolCalls.length > 0) return toolCalls;
-
-  // Pattern 5: DeepSeek DSML & Special Tokens (<｜｜DSML｜｜ ...> or <｜tool calls｜>...)
-  const dsCalls = parseDeepSeekToolCalls(text);
-  if (dsCalls && dsCalls.length > 0) return dsCalls;
 
   return null;
 }

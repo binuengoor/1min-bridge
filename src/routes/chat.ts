@@ -268,7 +268,6 @@ function buildStreamingResponse(
   },
 ): Response {
   const created = nowSec();
-  const hasTools = options?.hasTools ?? false;
   const allowedTools = options?.allowedTools;
 
   return new Response(
@@ -373,17 +372,13 @@ function buildStreamingResponse(
               if (content) {
                 fullContent += content;
 
-                if (hasTools) {
-                  pendingContentBuffer += content;
-                  // Flush safe prose prefix immediately; retain only the
-                  // suffix that may be an incomplete tool-call block.
-                  const [safeProse, retained] =
-                    ToolCallingEmulator.splitSafeProse(pendingContentBuffer);
-                  if (safeProse) flushContent(safeProse);
-                  pendingContentBuffer = retained;
-                } else {
-                  flushContent(content);
-                }
+                pendingContentBuffer += content;
+                // Flush safe prose prefix immediately; retain only the
+                // suffix that may be an incomplete tool-call block.
+                const [safeProse, retained] =
+                  ToolCallingEmulator.splitSafeProse(pendingContentBuffer);
+                if (safeProse) flushContent(safeProse);
+                pendingContentBuffer = retained;
               }
             }
           }
@@ -397,28 +392,22 @@ function buildStreamingResponse(
                 : content;
               if (text) {
                 fullContent += text;
-                if (hasTools) {
-                  pendingContentBuffer += text;
-                  const [safeProse, retained] =
-                    ToolCallingEmulator.splitSafeProse(pendingContentBuffer);
-                  if (safeProse) flushContent(safeProse);
-                  pendingContentBuffer = retained;
-                } else {
-                  flushContent(text);
-                }
+                pendingContentBuffer += text;
+                const [safeProse, retained] =
+                  ToolCallingEmulator.splitSafeProse(pendingContentBuffer);
+                if (safeProse) flushContent(safeProse);
+                pendingContentBuffer = retained;
               }
             }
           }
 
           // Check for tool calls in full accumulated content (primary +
           // Mistral/Qwen/XML fallback formats)
-          const toolCalls = hasTools
-            ? ToolCallingEmulator.parseResponseWithFallback(
-                fullContent,
-                allowedTools,
-                (t) => parseToolCalls(t),
-              )
-            : null;
+          const toolCalls = ToolCallingEmulator.parseResponseWithFallback(
+            fullContent,
+            allowedTools,
+            (t) => parseToolCalls(t),
+          );
           const hasToolCalls = toolCalls !== null && toolCalls.length > 0;
 
           if (hasToolCalls && toolCalls) {
@@ -669,13 +658,11 @@ app.post("/v1/chat/completions", async (c) => {
     }
 
     // Parse tool calls (primary + Mistral/Qwen/XML fallback)
-    const toolCalls = hasTools
-      ? ToolCallingEmulator.parseResponseWithFallback(
-          rawContent,
-          tools as ToolDefinition[],
-          (t) => parseToolCalls(t),
-        )
-      : null;
+    const toolCalls = ToolCallingEmulator.parseResponseWithFallback(
+      rawContent,
+      tools as ToolDefinition[],
+      (t) => parseToolCalls(t),
+    );
 
     const finishReason =
       toolCalls && toolCalls.length > 0 ? "tool_calls" : "stop";

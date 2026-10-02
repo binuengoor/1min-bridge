@@ -172,9 +172,39 @@ export class ToolJsonParser {
 
   static splitSafeProse(buffer: string): [string, string] {
     const idx = ToolJsonParser.findPotentialToolStart(buffer);
-    if (idx === -1) return [buffer, ""];
-    if (idx === 0) return ["", buffer];
-    return [buffer.slice(0, idx), buffer.slice(idx)];
+    if (idx !== -1) {
+      return idx === 0 ? ["", buffer] : [buffer.slice(0, idx), buffer.slice(idx)];
+    }
+
+    // Check if the tail of buffer matches a partial prefix of any tool marker
+    // (e.g. buffer ends with "<", "<｜", "<｜｜", "```", etc.)
+    const markers = [
+      "```json", "```", '"tool_calls"', "tool_calls", '"function"',
+      "TOOL_CALL:", "TOOL_CALL", "[TOOL_CALLS]", "✿FUNCTION✿",
+      "<tool_call", "<functioncall", '{"name"', '{"function"',
+      "<｜｜DSML", "<｜DSML", "<||DSML", "<|DSML", "<DSML", "<｜tool", "<|tool",
+    ];
+
+    let maxTailLen = 0;
+    for (const m of markers) {
+      const checkLen = Math.min(buffer.length, m.length - 1);
+      for (let len = checkLen; len >= 1; len--) {
+        if (buffer.endsWith(m.slice(0, len))) {
+          if (len > maxTailLen) maxTailLen = len;
+          break;
+        }
+      }
+    }
+
+    if (maxTailLen === 0 && (buffer.endsWith("{") || buffer.endsWith('{"'))) {
+      maxTailLen = buffer.endsWith('{"') ? 2 : 1;
+    }
+
+    if (maxTailLen > 0) {
+      return [buffer.slice(0, buffer.length - maxTailLen), buffer.slice(buffer.length - maxTailLen)];
+    }
+
+    return [buffer, ""];
   }
 
   static isPotentialToolCallBuffer(buffer: string): boolean {
