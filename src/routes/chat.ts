@@ -422,12 +422,13 @@ function buildStreamingResponse(
           const hasToolCalls = toolCalls !== null && toolCalls.length > 0;
 
           if (hasToolCalls && toolCalls) {
-            // Emit any prose that preceded the tool JSON (stripped of tool
-            // blocks) so it is not swallowed, then progressive tool deltas.
+            // Emit any residual unflushed prose in pendingContentBuffer
+            // (stripped of tool blocks) so trailing prose is not swallowed.
             const proseRemainder = ResponseSanitizer.cleanOutput(
-              ResponseSanitizer.stripToolJson(fullContent),
+              ResponseSanitizer.stripToolJson(pendingContentBuffer),
             );
             if (proseRemainder) flushContent(proseRemainder);
+            pendingContentBuffer = "";
 
             const deltas =
               ToolCallingEmulator.formatProgressiveToolCallDeltas(toolCalls);

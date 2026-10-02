@@ -33,6 +33,20 @@ export class ResponseSanitizer {
     out = out.replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, "");
     out = out.replace(/<functioncall>[\s\S]*?<\/functioncall>/gi, "");
     out = out.replace(/<invoke>[\s\S]*?<\/invoke>/gi, "");
+    out = out.replace(
+      /<[｜|]{1,2}DSML[｜|]{1,2}\s*(?:calls|tool_calls|function_calls)>[\s\S]*?<\/[｜|]{1,2}DSML[｜|]{1,2}\s*(?:calls|tool_calls|function_calls)>/gi,
+      "",
+    );
+    out = out.replace(
+      /<(?:[｜|]{1,2}DSML[｜|]{1,2}\s*)?invoke\b[\s\S]*?<\/(?:[｜|]{1,2}DSML[｜|]{1,2}\s*)?invoke>/gi,
+      "",
+    );
+    out = out.replace(
+      /<[｜|]tool calls[｜|]>[\s\S]*?(?:<[｜|]tool calls end[｜|]>|$)/gi,
+      "",
+    );
+    out = out.replace(/<\/?(?:[｜|]{1,2})?DSML(?:[｜|]{1,2})?[^>]*>/gi, "");
+    out = out.replace(/<[｜|]\/?tool[^>]*[｜|]>/gi, "");
     return out;
   }
 
@@ -56,6 +70,22 @@ export class ResponseSanitizer {
     cleaned = cleaned.replace(/<functioncall>[\s\S]*?<\/functioncall>/gi, "");
     cleaned = cleaned.replace(/<invoke>[\s\S]*?<\/invoke>/gi, "");
     cleaned = cleaned.replace(/<tools>[\s\S]*?<\/tools>/gi, "");
+
+    // 2b. Remove DeepSeek DSML tool blocks and residual tokens
+    cleaned = cleaned.replace(
+      /<[｜|]{1,2}DSML[｜|]{1,2}\s*(?:calls|tool_calls|function_calls)>[\s\S]*?<\/[｜|]{1,2}DSML[｜|]{1,2}\s*(?:calls|tool_calls|function_calls)>/gi,
+      "",
+    );
+    cleaned = cleaned.replace(
+      /<(?:[｜|]{1,2}DSML[｜|]{1,2}\s*)?invoke\b[\s\S]*?<\/(?:[｜|]{1,2}DSML[｜|]{1,2}\s*)?invoke>/gi,
+      "",
+    );
+    cleaned = cleaned.replace(
+      /<[｜|]tool calls[｜|]>[\s\S]*?(?:<[｜|]tool calls end[｜|]>|$)/gi,
+      "",
+    );
+    cleaned = cleaned.replace(/<\/?(?:[｜|]{1,2})?DSML(?:[｜|]{1,2})?[^>]*>/gi, "");
+    cleaned = cleaned.replace(/<[｜|]\/?tool[^>]*[｜|]>/gi, "");
 
     // 3. Remove leaked "Tool: [...]" or "Tool: {...}" blocks
     cleaned = cleaned.replace(/Tool:\s*(?:\[[\s\S]*?\]|\{[\s\S]*?\})\s*/gi, "");

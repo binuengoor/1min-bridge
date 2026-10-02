@@ -4,6 +4,7 @@
 
 import type { ChatMessage, ToolCall } from "../types.js";
 import { randomUUID } from "node:crypto";
+import { ToolJsonParser } from "./tool-json-parser.js";
 
 export interface ToolDefinition {
   type?: string;
@@ -147,7 +148,7 @@ Strict Tool Call Format:
   ): ToolCall[] | null {
     if (!content || typeof content !== "string") return null;
 
-    // 0. Remove <think>...</think> reasoning monologue
+    // Remove <think>...</think> reasoning monologue
     const sanitized = content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
     if (!sanitized) return null;
 
@@ -156,296 +157,53 @@ Strict Tool Call Format:
     for (const match of mdMatches) {
       if (!match?.[1]) continue;
       const candidate = match[1].trim();
-      const parsed = ToolCallingEmulator.safeJsonParse(candidate);
+      const parsed = ToolJsonParser.safeJsonParse(candidate);
       if (parsed) {
-        const extracted = ToolCallingEmulator.extractFromDecoded(
-          parsed,
-          allowedTools,
-        );
+        const extracted = ToolJsonParser.extractFromDecoded(parsed, allowedTools);
         if (extracted) return extracted;
       }
     }
 
     // 2. Balanced JSON parser scanning across all '{'
-    const balancedList = ToolCallingEmulator.extractAllBalancedJsonBlocks(sanitized);
+    const balancedList = ToolJsonParser.extractAllBalancedJsonBlocks(sanitized);
     for (const block of balancedList) {
-      const extracted = ToolCallingEmulator.extractFromDecoded(
-        block,
-        allowedTools,
-      );
+      const extracted = ToolJsonParser.extractFromDecoded(block, allowedTools);
       if (extracted) return extracted;
     }
 
     return null;
   }
 
-  /**
-   * Balanced brace parser that extracts complete JSON objects from raw text.
-   */
   static extractAllBalancedJsonBlocks(text: string): unknown[] {
-    const results: unknown[] = [];
-    let searchFrom = 0;
-
-    while (searchFrom < text.length) {
-      const start = text.indexOf("{", searchFrom);
-      if (start === -1) break;
-
-      let braceCount = 0;
-      let insideString = false;
-      let isEscaped = false;
-
-      for (let i = start; i < text.length; i++) {
-        const char = text[i];
-
-        if (insideString) {
-          if (isEscaped) {
-            isEscaped = false;
-          } else if (char === "\\") {
-            isEscaped = true;
-          } else if (char === '"') {
-            insideString = false;
-          }
-          continue;
-        }
-
-        if (char === '"') {
-          insideString = true;
-          continue;
-        }
-
-        if (char === "{") {
-          braceCount++;
-        } else if (char === "}") {
-          braceCount--;
-          if (braceCount === 0) {
-            const candidate = text.slice(start, i + 1);
-            const decoded = ToolCallingEmulator.safeJsonParse(candidate);
-            if (decoded && typeof decoded === "object") {
-              results.push(decoded);
-            }
-            searchFrom = i + 1;
-            break;
-          }
-        }
-      }
-
-      if (braceCount !== 0) {
-        searchFrom = start + 1;
-      }
-    }
-
-    return results;
+    return ToolJsonParser.extractAllBalancedJsonBlocks(text);
   }
 
-  private static extractFromDecoded(
-    data: unknown,
-    allowedTools?: ToolDefinition[],
-  ): ToolCall[] | null {
-    if (!data || typeof data !== "object") return null;
-    const record = data as Record<string, unknown>;
-
-    const validNames = allowedTools
-      ? allowedTools
-          .map((t) => t.function?.name || t.name)
-          .filter((n): n is string => typeof n === "string")
-      : null;
-
-    const isAllowedName = (name: string): boolean => {
-      if (!validNames || validNames.length === 0) return true;
-      return validNames.includes(name);
-    };
-
-    // Pattern A: { tool_calls: [...] }
-    if (Array.isArray(record.tool_calls) && record.tool_calls.length > 0) {
-      const items: ToolCall[] = [];
-      for (const tc of record.tool_calls) {
-        if (!tc || typeof tc !== "object") continue;
-        const item = tc as Record<string, unknown>;
-        const fnObj = (item.function as Record<string, unknown>) || {};
-        const name = (fnObj.name as string) || (item.name as string);
-        const rawArgs = fnObj.arguments ?? item.arguments ?? {};
-        const argsStr = ToolCallingEmulator.normalizeArguments(rawArgs);
-
-        if (name && isAllowedName(name)) {
-          items.push({
-            id: (item.id as string) || `call_${randomUUID().slice(0, 8)}`,
-            type: "function",
-            function: { name, arguments: argsStr },
-          });
-        }
-      }
-      return items.length > 0 ? items : null;
-    }
-
-    // Pattern B: Single tool call { name: "...", arguments: {...} }
-    if (record.name && typeof record.name === "string") {
-      const name = record.name;
-      if (
-        (record.arguments !== undefined || record.parameters !== undefined) &&
-        isAllowedName(name)
-      ) {
-        const rawArgs = record.arguments ?? record.parameters ?? {};
-        return [
-          {
-            id: `call_${randomUUID().slice(0, 8)}`,
-            type: "function",
-            function: {
-              name,
-              arguments: ToolCallingEmulator.normalizeArguments(rawArgs),
-            },
-          },
-        ];
-      }
-    }
-
-    // Pattern C: { function: { name: "...", arguments: ... } }
-    if (
-      record.function &&
-      typeof record.function === "object" &&
-      typeof (record.function as Record<string, unknown>).name === "string"
-    ) {
-      const fnObj = record.function as Record<string, unknown>;
-      const name = fnObj.name as string;
-      if (isAllowedName(name)) {
-        const rawArgs = fnObj.arguments ?? fnObj.parameters ?? {};
-        return [
-          {
-            id: `call_${randomUUID().slice(0, 8)}`,
-            type: "function",
-            function: {
-              name,
-              arguments: ToolCallingEmulator.normalizeArguments(rawArgs),
-            },
-          },
-        ];
-      }
-    }
-
-    return null;
-  }
-
-  /**
-   * Normalizes argument objects or strings into a valid serialized JSON string.
-   */
   static normalizeArguments(args: unknown): string {
-    if (typeof args === "string") {
-      try {
-        const parsed = JSON.parse(args);
-        return JSON.stringify(parsed);
-      } catch {
-        return JSON.stringify({ input: args });
-      }
-    } else if (typeof args === "object" && args !== null) {
-      return JSON.stringify(args);
-    }
-    return JSON.stringify({});
+    return ToolJsonParser.normalizeArguments(args);
   }
 
   static formatStreamingToolCalls(toolCalls: ToolCall[]) {
-    return toolCalls.map((tc, index) => ({
-      index,
-      id: tc.id,
-      type: "function" as const,
-      function: {
-        name: tc.function.name,
-        arguments: tc.function.arguments,
-      },
-    }));
+    return ToolJsonParser.formatStreamingToolCalls(toolCalls);
   }
 
-  /**
-   * Builds OpenAI-spec progressive tool-call delta chunks: one starter chunk
-   * per tool (id+name+empty args), then ~64-char argument slices, leaving the
-   * terminal finish_reason to the caller (emit exactly one).
-   */
-  static formatProgressiveToolCallDeltas(
-    toolCalls: ToolCall[],
-    sliceSize = 64,
-  ): Array<{ index: number; id?: string; type?: "function"; function?: { name?: string; arguments?: string } }> {
-    const deltas: Array<{
-      index: number;
-      id?: string;
-      type?: "function";
-      function?: { name?: string; arguments?: string };
-    }> = [];
-    toolCalls.forEach((tc, index) => {
-      deltas.push({
-        index,
-        id: tc.id,
-        type: "function",
-        function: { name: tc.function.name, arguments: "" },
-      });
-      const args = tc.function.arguments ?? "";
-      for (let i = 0; i < args.length; i += sliceSize) {
-        deltas.push({
-          index,
-          function: { arguments: args.slice(i, i + sliceSize) },
-        });
-      }
-    });
-    return deltas;
+  static formatProgressiveToolCallDeltas(toolCalls: ToolCall[], sliceSize = 64) {
+    return ToolJsonParser.formatProgressiveToolCallDeltas(toolCalls, sliceSize);
   }
 
-  /**
-   * Locates the earliest index where a tool-call JSON/XML block may start.
-   * Returns -1 when no marker is present (buffer is pure prose).
-   */
   static findPotentialToolStart(buffer: string): number {
-    const markers = [
-      "```json",
-      "```",
-      '"tool_calls"',
-      "tool_calls",
-      '"function"',
-      "TOOL_CALL:",
-      "TOOL_CALL",
-      "[TOOL_CALLS]",
-      "✿FUNCTION✿",
-      "<tool_call",
-      "<functioncall",
-      '{"name"',
-      '{"function"',
-    ];
-    let earliest = -1;
-    for (const m of markers) {
-      const idx = buffer.indexOf(m);
-      if (idx !== -1 && (earliest === -1 || idx < earliest)) {
-        earliest = idx;
-      }
-    }
-    // Bare "{" only counts when followed by tool-ish keys nearby
-    const braceIdx = buffer.indexOf("{");
-    if (braceIdx !== -1) {
-      const window = buffer.slice(braceIdx, braceIdx + 200);
-      if (/\"(name|function|tool_calls|arguments)\"\s*:/.test(window)) {
-        if (earliest === -1 || braceIdx < earliest) earliest = braceIdx;
-      }
-    }
-    return earliest;
+    return ToolJsonParser.findPotentialToolStart(buffer);
   }
 
-  /**
-   * Splits a streaming buffer into safe prose prefix (flush immediately) and
-   * retained suffix (may be incomplete tool JSON). Returns [prose, retained].
-   */
   static splitSafeProse(buffer: string): [string, string] {
-    const idx = ToolCallingEmulator.findPotentialToolStart(buffer);
-    if (idx === -1) return [buffer, ""];
-    if (idx === 0) return ["", buffer];
-    return [buffer.slice(0, idx), buffer.slice(idx)];
+    return ToolJsonParser.splitSafeProse(buffer);
   }
 
   static isPotentialToolCallBuffer(buffer: string): boolean {
-    if (!buffer || !buffer.trim()) return false;
-    // Complete tool JSON is handled at end-of-stream; while streaming we only
-    // hold back the suffix that could be an incomplete tool block.
-    const [, retained] = ToolCallingEmulator.splitSafeProse(buffer);
-    return retained.length > 0;
+    return ToolJsonParser.isPotentialToolCallBuffer(buffer);
   }
 
   /**
-   * Primary parser with tool-parser.ts fallback (Mistral [TOOL_CALLS],
-   * Qwen ✿FUNCTION✿, TOOL_CALL: formats) when balanced-JSON finds nothing.
+   * Primary parser with fallback when balanced-JSON finds nothing.
    */
   static parseResponseWithFallback(
     content: string,
@@ -474,19 +232,7 @@ Strict Tool Call Format:
     return null;
   }
 
-  private static safeJsonParse(str: string): unknown {
-    try {
-      return JSON.parse(str);
-    } catch {
-      // Minimal repair: strip trailing commas and JS-style comments
-      try {
-        const repaired = str
-          .replace(/\/\*[\s\S]*?\*\//g, "")
-          .replace(/,\s*([}\]])/g, "$1");
-        return JSON.parse(repaired);
-      } catch {
-        return null;
-      }
-    }
+  static safeJsonParse(str: string): unknown {
+    return ToolJsonParser.safeJsonParse(str);
   }
 }

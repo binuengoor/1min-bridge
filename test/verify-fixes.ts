@@ -5,8 +5,10 @@
 import assert from "node:assert";
 import { rateLimitMiddleware } from "../src/middleware/rate-limit.js";
 import { ToolCallingEmulator } from "../src/adapters/tool-emulator.js";
+import { parseToolCalls } from "../src/adapters/tool-parser.js";
 import { ResponseSanitizer } from "../src/adapters/sanitizer.js";
 import { calculateTokens, extractAllChatMessageText } from "../src/utils/tokens.js";
+import { hasIncompleteDeepSeekToolCall } from "../src/adapters/deepseek-parser.js";
 import { getModelData, isValidModel, isVisionModel, isImageModel } from "../src/model-registry.js";
 import { incrementCounter, observeHistogram, getMetricsText } from "../src/metrics.js";
 
@@ -98,6 +100,71 @@ I need to check the weather for New York. Let me call get_weather.
   assert.ok(parsedNested, "Should extract nested tool call from arbitrary text");
   assert.strictEqual(parsedNested.length, 1);
   assert.strictEqual(parsedNested[0]!.function.name, "get_weather");
+
+  // DeepSeek DSML tool calling parsing (as produced by DeepSeek V4 models)
+  const dsmlResponse = `<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="skill_view">
+<｜｜DSML｜｜ parameter name="name" string="true">homelab-ops</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+<｜｜DSML｜｜ invoke name="read_file">
+<｜｜DSML｜｜ parameter name="path" string="true">/home/millionmax/docs/obsidian/beep-notes/90. System/Agent-Memory/HOMELAB.md</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+<｜｜DSML｜｜ invoke name="search_files">
+<｜｜DSML｜｜ parameter name="pattern" string="true">HA_TOKEN|homeassistant|10.1.1.50|8123</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="path" string="true">/home/millionmax/.hermes</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="file_glob" string="true">*.yaml</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>`;
+
+  const dsmlParsed = ToolCallingEmulator.parseResponseWithFallback(
+    dsmlResponse,
+    [
+      { name: "skill_view" },
+      { name: "read_file" },
+      { name: "search_files" },
+    ],
+    (t) => parseToolCalls(t),
+  );
+  assert.ok(dsmlParsed, "Should parse DeepSeek DSML tool calls");
+  assert.strictEqual(dsmlParsed.length, 3, "Should have 3 parsed tool calls");
+  assert.strictEqual(dsmlParsed[0]!.function.name, "skill_view");
+  assert.deepStrictEqual(JSON.parse(dsmlParsed[0]!.function.arguments), { name: "homelab-ops" });
+  assert.strictEqual(dsmlParsed[1]!.function.name, "read_file");
+  assert.deepStrictEqual(JSON.parse(dsmlParsed[1]!.function.arguments), {
+    path: "/home/millionmax/docs/obsidian/beep-notes/90. System/Agent-Memory/HOMELAB.md",
+  });
+  assert.strictEqual(dsmlParsed[2]!.function.name, "search_files");
+  assert.deepStrictEqual(JSON.parse(dsmlParsed[2]!.function.arguments), {
+    pattern: "HA_TOKEN|homeassistant|10.1.1.50|8123",
+    path: "/home/millionmax/.hermes",
+    file_glob: "*.yaml",
+  });
+
+  // Streaming safe prose detection for DSML
+  const [safeProse, retained] = ToolCallingEmulator.splitSafeProse("Let me check the files:\n" + dsmlResponse);
+  assert.strictEqual(safeProse.trim(), "Let me check the files:");
+  assert.ok(retained.includes("<｜｜DSML｜｜ calls>"));
+  // DSML parameter attribute order and whitespace tolerance
+  const dsmlReordered = `<｜DSML｜invoke name="custom_action">
+<｜DSML｜parameter string="true" name="query">SELECT 1</｜DSML｜parameter>
+<｜DSML｜parameter name="limit">10</｜DSML｜parameter>
+</｜DSML｜invoke>`;
+  const parsedReordered = parseToolCalls(dsmlReordered);
+  assert.ok(parsedReordered, "Should parse DSML with reordered attributes and compact tags");
+  assert.strictEqual(parsedReordered.length, 1);
+  assert.strictEqual(parsedReordered[0]!.function.name, "custom_action");
+  assert.deepStrictEqual(JSON.parse(parsedReordered[0]!.function.arguments), { query: "SELECT 1", limit: 10 });
+
+  // Residual DSML tag stripping in ResponseSanitizer
+  const dirtyDsml = "Here is the response.<｜｜DSML｜｜ calls><｜tool calls end｜>";
+  assert.strictEqual(ResponseSanitizer.cleanOutput(dirtyDsml), "Here is the response.");
+
+  // Incomplete tool call detection (calls block open with one closed invoke inside)
+  const incompleteMultiInvoke = `<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="skill_view">
+<｜｜DSML｜｜ parameter name="name" string="true">homelab-ops</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>`;
+  assert.strictEqual(hasIncompleteDeepSeekToolCall(incompleteMultiInvoke), true, "Calls block still open despite invoke closed");
 
   console.log("  ✅ ToolCallingEmulator and balanced JSON parsing verified.\n");
 

@@ -3,6 +3,12 @@
 // ============================================================================
 
 import type { ToolCall } from "../types.js";
+import {
+  parseDeepSeekToolCalls,
+  stripDeepSeekToolCalls,
+  hasIncompleteDeepSeekToolCall,
+  DEEPSEEK_TOOL_PREFIXES,
+} from "./deepseek-parser.js";
 
 let callCounter = 0;
 function makeToolCall(name: string, args: Record<string, unknown>): ToolCall {
@@ -27,42 +33,6 @@ export interface ChatTool {
   type: "function";
   function: ToolFunction;
   tool_choice?: string;
-}
-
-export function buildToolSystemPrompt(
-  tools: ChatTool[],
-  toolChoice?: string,
-): string {
-  const toolDescriptions = tools.map((tool) => {
-    const fn = tool.function;
-    const params = fn.parameters || {};
-    return "- " + fn.name + ": " + (fn.description || "No description") + "\n  Parameters: " + JSON.stringify(params);
-  });
-
-  const toolsBlock = toolDescriptions.join("\n\n");
-
-  let callInstruction: string;
-  if (toolChoice === "required") {
-    callInstruction = "You MUST call one of the available tools. Do NOT respond with plain text.";
-  } else if (toolChoice === "none") {
-    return "";
-  } else {
-    callInstruction = "If the user request can be answered by calling a tool, do so. Otherwise respond normally.";
-  }
-
-  return [
-    "## Available Tools",
-    "",
-    "To call a tool, output JSON with name and arguments:",
-    "",
-    "TOOL_CALL: {\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}",
-    "",
-    "Available tools:",
-    "",
-    toolsBlock,
-    "",
-    callInstruction,
-  ].join("\n");
 }
 
 export function parseToolCalls(text: string): ToolCall[] | null {
@@ -119,8 +89,13 @@ export function parseToolCalls(text: string): ToolCall[] | null {
       toolCalls.push(makeToolCall(match[1]!.trim(), JSON.parse(match[2]!)));
     } catch { /* skip */ }
   }
+  if (toolCalls.length > 0) return toolCalls;
 
-  return toolCalls.length > 0 ? toolCalls : null;
+  // Pattern 5: DeepSeek DSML & Special Tokens (<｜｜DSML｜｜ ...> or <｜tool calls｜>...)
+  const dsCalls = parseDeepSeekToolCalls(text);
+  if (dsCalls && dsCalls.length > 0) return dsCalls;
+
+  return null;
 }
 
 export function stripToolCalls(text: string): string {
@@ -153,6 +128,9 @@ export function stripToolCalls(text: string): string {
   // Strip ✿FUNCTION✿: ... ✿ARGS✿: {...}
   result = result.replace(/✿FUNCTION✿:[\s\S]*?✿ARGS✿:\s*\{.*?\}/gs, "");
 
+  // Strip DeepSeek DSML & Special Tokens
+  result = stripDeepSeekToolCalls(result);
+
   return result.trim();
 }
 
@@ -160,10 +138,19 @@ export function hasIncompleteToolCall(buffer: string): boolean {
   if (buffer.includes("TOOL_CALL:") && (!buffer.includes("}") || !parseToolCalls(buffer))) return true;
   if (buffer.includes("[TOOL_CALLS]") && !/\[TOOL_CALLS\]\s*\[.*?\]/s.test(buffer)) return true;
   if (buffer.includes("✿FUNCTION✿") && (!buffer.includes("✿ARGS✿") || !/✿ARGS✿:\s*\{.*?\}/s.test(buffer))) return true;
+  if (hasIncompleteDeepSeekToolCall(buffer)) return true;
   return false;
 }
 
-const TOOL_PREFIXES = ["TOOL_CALL:", "[TOOL_CALLS]", "✿FUNCTION✿", "TOOL_CALL", "[TOOL", "✿"];
+const TOOL_PREFIXES = [
+  "TOOL_CALL:",
+  "[TOOL_CALLS]",
+  "✿FUNCTION✿",
+  "TOOL_CALL",
+  "[TOOL",
+  "✿",
+  ...DEEPSEEK_TOOL_PREFIXES,
+];
 
 export function isPotentialToolCallBuffer(buffer: string): boolean {
   const trimmed = buffer.trimStart();
