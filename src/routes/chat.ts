@@ -12,8 +12,20 @@ import { getModelData, isVisionModel } from "../model-registry.js";
 import {
   callChat,
   callChatStream,
+  callOpenAiChat,
+  callOpenAiChatStream,
+  chatText,
+  chatTextStream,
+  extractLegacyText,
+  iterateOpenAiSse,
+  shouldFallbackToLegacy,
+  supportsNativeTools,
+  toNativeOpenAiMessages,
+  toPlainOpenAiMessages,
   uploadAsset,
+  type OpenAiChatBody,
 } from "../adapters/onemin.js";
+import { config } from "../config.js";
 import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
 import {
   ToolCallingEmulator,
@@ -28,6 +40,7 @@ import type {
   ChatCompletionResponse,
   ChatCompletionChunk,
   ChatMessage,
+  ToolCall,
   ChatContentPart,
   OneMinRequestBody,
 } from "../types.js";
@@ -513,6 +526,204 @@ function buildStreamingResponse(
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI-upstream helpers (native tool calling + passthrough streaming)
+// ---------------------------------------------------------------------------
+
+/** Normalise OpenAI/Anthropic-style tool defs to OpenAI `tools` entries. */
+function toNativeTools(tools: ToolDefinition[]): unknown[] {
+  return tools.map((t) => ({
+    type: "function",
+    function: {
+      name: t.function?.name || t.name || "unnamed_tool",
+      description: t.function?.description || t.description || "",
+      parameters: t.function?.parameters ||
+        t.parameters ||
+        t.input_schema || { type: "object", properties: {} },
+    },
+  }));
+}
+
+function toNativeToolChoice(choice: unknown): unknown {
+  if (choice === undefined) return undefined;
+  if (typeof choice === "string") return choice;
+  if (typeof choice === "object" && choice !== null) {
+    const c = choice as { type?: string; name?: string; function?: { name?: string } };
+    if (c.type === "any") return "required";
+    if (c.type === "auto") return "auto";
+    if (c.function?.name) return { type: "function", function: { name: c.function.name } };
+    if (c.type === "tool" && c.name) return { type: "function", function: { name: c.name } };
+  }
+  return undefined;
+}
+
+/** True when the caller insists on a tool call (retry via ReAct is allowed). */
+function forcesToolCall(choice: unknown): boolean {
+  if (choice === "required") return true;
+  if (typeof choice === "object" && choice !== null) {
+    const c = choice as { type?: string; function?: unknown };
+    return c.type === "any" || c.type === "tool" || Boolean(c.function);
+  }
+  return false;
+}
+
+function sampling(body: ChatCompletionRequest) {
+  const maxTokens = body.max_tokens ?? body.max_completion_tokens;
+  return {
+    ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
+    ...(body.top_p !== undefined ? { top_p: body.top_p } : {}),
+    ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+    ...(body.stop !== undefined ? { stop: body.stop } : {}),
+    ...(body.frequency_penalty !== undefined ? { frequency_penalty: body.frequency_penalty } : {}),
+    ...(body.presence_penalty !== undefined ? { presence_penalty: body.presence_penalty } : {}),
+  };
+}
+
+/**
+ * Stream a native tool-calling model: forward upstream chat.completion.chunk
+ * deltas (id/model rewritten). If a tools request ends with prose that holds a
+ * textual tool call, convert it into tool_call deltas.
+ */
+function buildNativeStreamingResponse(
+  upstream: ReadableStream<Uint8Array>,
+  model: string,
+  chatId: string,
+  options: {
+    allowedTools: ToolDefinition[];
+    includeUsage: boolean;
+    promptTokens: number;
+  },
+): Response {
+  const created = nowSec();
+  const encoder = new TextEncoder();
+  const send = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    chunk: ChatCompletionChunk,
+  ) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      async start(controller) {
+        let fullContent = "";
+        let sawToolCalls = false;
+        let finishReason: string | null = null;
+        let upstreamUsage:
+          | { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+          | undefined;
+        try {
+          for await (const chunk of iterateOpenAiSse(upstream)) {
+            if (chunk.usage) upstreamUsage = chunk.usage;
+            const choice = chunk.choices?.[0];
+            if (!choice) continue;
+            const delta = choice.delta ?? {};
+            if (typeof delta.content === "string") fullContent += delta.content;
+            if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+              sawToolCalls = true;
+            }
+            if (choice.finish_reason) {
+              finishReason = choice.finish_reason;
+              if (!delta.content && !delta.tool_calls) continue; // hold final marker
+            }
+            send(controller, {
+              id: chatId,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              choices: [
+                {
+                  index: 0,
+                  delta: delta as ChatCompletionChunk["choices"][number]["delta"],
+                  finish_reason: null,
+                },
+              ],
+            });
+          }
+
+          if (!sawToolCalls && fullContent) {
+            const parsed = ToolCallingEmulator.parseResponseWithFallback(
+              fullContent,
+              options.allowedTools,
+              (t) => parseToolCalls(t),
+            );
+            if (parsed && parsed.length > 0) {
+              sawToolCalls = true;
+              for (const d of ToolCallingEmulator.formatProgressiveToolCallDeltas(parsed)) {
+                send(controller, {
+                  id: chatId,
+                  object: "chat.completion.chunk",
+                  created,
+                  model,
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        tool_calls: [
+                          {
+                            index: d.index,
+                            ...(d.id ? { id: d.id } : {}),
+                            type: "function",
+                            function: { ...d.function },
+                          },
+                        ],
+                      },
+                      finish_reason: null,
+                    },
+                  ],
+                });
+              }
+            }
+          }
+
+          send(controller, {
+            id: chatId,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [
+              {
+                index: 0,
+                delta: {},
+                finish_reason: sawToolCalls ? "tool_calls" : (finishReason ?? "stop"),
+              },
+            ],
+          });
+
+          if (options.includeUsage) {
+            const completionTokens =
+              upstreamUsage?.completion_tokens ?? calculateTokens(fullContent);
+            const promptTokens = upstreamUsage?.prompt_tokens ?? options.promptTokens;
+            send(controller, {
+              id: chatId,
+              object: "chat.completion.chunk",
+              created,
+              model,
+              choices: [],
+              usage: {
+                prompt_tokens: promptTokens,
+                completion_tokens: completionTokens,
+                total_tokens: promptTokens + completionTokens,
+              },
+            });
+          }
+          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+          controller.close();
+        } catch (err) {
+          console.error("Native stream error:", err);
+          controller.error(err);
+        }
+      },
+    }),
+    {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        "X-Request-Id": chatId,
+      },
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Route handler
 // ---------------------------------------------------------------------------
 
@@ -621,6 +832,33 @@ app.post("/v1/chat/completions", async (c) => {
 
   const chatId = newChatId();
 
+  // Route selection. The OpenAI-compatible upstream is primary; features that
+  // only exist on the legacy endpoint (web search, vision attachments,
+  // brand voice, memories, conversation ids) stay on /api/chat-with-ai.
+  const legacyOnly =
+    webSearch ||
+    isVision ||
+    [brandVoiceId, conversationId, numOfSite, maxWord, historyMessageLimit, withMemories].some(
+      (v) => v !== undefined,
+    );
+  const useOpenAi = config.oneMinOpenAiEnabled && !legacyOnly;
+  const nativeMode = useOpenAi && hasTools && supportsNativeTools(cleanModel);
+  const sampled = sampling(body);
+  const emulatedBody: OpenAiChatBody = {
+    model: cleanModel,
+    messages: toPlainOpenAiMessages(finalMessages),
+    ...sampled,
+  };
+  const nativeBody: OpenAiChatBody = {
+    model: cleanModel,
+    messages: toNativeOpenAiMessages(messages),
+    ...(tools && hasTools ? { tools: toNativeTools(tools as ToolDefinition[]) } : {}),
+    ...(toNativeToolChoice(tool_choice) !== undefined
+      ? { tool_choice: toNativeToolChoice(tool_choice) }
+      : {}),
+    ...sampled,
+  };
+
   try {
     if (stream) {
       const streamingOptions = {
@@ -630,7 +868,23 @@ app.post("/v1/chat/completions", async (c) => {
         promptTokens: calculateTokens(prompt),
       };
 
-      const streamBody = await callChatStream(apiKey, payload);
+      if (nativeMode) {
+        try {
+          const raw = await callOpenAiChatStream(apiKey, nativeBody);
+          return buildNativeStreamingResponse(raw, cleanModel, chatId, {
+            allowedTools: tools as ToolDefinition[],
+            includeUsage: streamingOptions.includeUsage,
+            promptTokens: streamingOptions.promptTokens,
+          });
+        } catch (err) {
+          if (!shouldFallbackToLegacy(err)) throw err;
+          console.warn("Native tool stream failed, using ReAct emulation:", (err as Error).message);
+        }
+      }
+
+      const streamBody = useOpenAi
+        ? await chatTextStream(apiKey, emulatedBody, payload)
+        : await callChatStream(apiKey, payload);
       const syntheticResponse = new Response(streamBody, {
         headers: { "Content-Type": "text/event-stream" },
       });
@@ -643,26 +897,59 @@ app.post("/v1/chat/completions", async (c) => {
     }
 
     // Non-streaming
-    const data = await callChat(apiKey, payload);
-    const resultObj = data.aiRecord?.aiRecordDetail?.resultObject;
     let rawContent = "";
-    if (typeof resultObj === "string") {
-      rawContent = resultObj;
-    } else if (
-      Array.isArray(resultObj) &&
-      typeof resultObj[0] === "string"
-    ) {
-      rawContent = resultObj[0];
-    } else if (resultObj && typeof resultObj === "object") {
-      rawContent = JSON.stringify(resultObj);
+    let nativeToolCalls: ToolCall[] | null = null;
+    let nativeHandled = false;
+
+    if (nativeMode) {
+      try {
+        const res = await callOpenAiChat(apiKey, nativeBody);
+        const msg = res.choices?.[0]?.message;
+        if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) {
+          nativeToolCalls = msg.tool_calls.map((tc, i) => ({
+            id: tc.id || `call_${randomUUID().replace(/-/g, "").slice(0, 24)}_${i}`,
+            type: "function" as const,
+            function: {
+              name: tc.function.name,
+              arguments:
+                typeof tc.function.arguments === "string"
+                  ? tc.function.arguments
+                  : JSON.stringify(tc.function.arguments ?? {}),
+            },
+          }));
+          nativeHandled = true;
+        } else if (typeof msg?.content === "string") {
+          rawContent = msg.content;
+          nativeHandled = true;
+          // Prose that holds a textual tool call is still honoured below; a
+          // forced tool_choice that yielded prose is retried through ReAct.
+          const textual = ToolCallingEmulator.parseResponseWithFallback(
+            rawContent,
+            tools as ToolDefinition[],
+            (t) => parseToolCalls(t),
+          );
+          if (!textual && forcesToolCall(tool_choice)) nativeHandled = false;
+        }
+      } catch (err) {
+        if (!shouldFallbackToLegacy(err)) throw err;
+        console.warn("Native tool call failed, using ReAct emulation:", (err as Error).message);
+      }
+    }
+
+    if (!nativeHandled) {
+      rawContent = useOpenAi
+        ? await chatText(apiKey, emulatedBody, payload)
+        : extractLegacyText(await callChat(apiKey, payload));
     }
 
     // Parse tool calls (primary + Mistral/Qwen/XML fallback)
-    const toolCalls = ToolCallingEmulator.parseResponseWithFallback(
-      rawContent,
-      tools as ToolDefinition[],
-      (t) => parseToolCalls(t),
-    );
+    const toolCalls =
+      nativeToolCalls ??
+      ToolCallingEmulator.parseResponseWithFallback(
+        rawContent,
+        tools as ToolDefinition[],
+        (t) => parseToolCalls(t),
+      );
 
     const finishReason =
       toolCalls && toolCalls.length > 0 ? "tool_calls" : "stop";

@@ -425,6 +425,8 @@ export interface AppConfig {
   oneMinStreamingUrl: string;
   oneMinChatApiUrl: string;
   oneMinChatStreamingUrl: string;
+  oneMinOpenAiChatUrl: string;
+  oneMinOpenAiEnabled: boolean;
   oneMinModelsUrl: string;
   oneMinAssetUrl: string;
   cacheTtlMs: number;

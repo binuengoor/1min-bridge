@@ -7,8 +7,9 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { getModelData } from "../model-registry.js";
 import {
-  callChat,
-  callChatStream,
+  chatText,
+  chatTextStream,
+  type OpenAiChatBody,
 } from "../adapters/onemin.js";
 import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
 import { ResponseSanitizer } from "../adapters/sanitizer.js";
@@ -211,9 +212,21 @@ app.post("/v1/responses", async (c) => {
     },
   };
 
+  // Prompt is already structured (response_format enforced at prompt level).
+  const openAiBody: OpenAiChatBody = {
+    model: cleanModel,
+    messages: [{ role: "user", content: prompt }],
+    ...(body.max_output_tokens ? { max_tokens: body.max_output_tokens } : {}),
+  };
+  const legacyOnly =
+    webSearch ||
+    ["brandVoiceId", "conversationId", "numOfSite", "maxWord", "historyMessageLimit", "withMemories"].some(
+      (k) => rExtra[k] !== undefined,
+    );
+
   try {
     if (body.stream) {
-      const streamBody = await callChatStream(apiKey, payload);
+      const streamBody = await chatTextStream(apiKey, openAiBody, payload, legacyOnly);
       const encoder = new TextEncoder();
       const promptTokens = calculateTokens(prompt);
 
@@ -313,16 +326,7 @@ app.post("/v1/responses", async (c) => {
     }
 
     // Non-streaming
-    const data = await callChat(apiKey, payload);
-    const resultObj = data.aiRecord?.aiRecordDetail?.resultObject;
-    let rawContent = "";
-    if (typeof resultObj === "string") {
-      rawContent = resultObj;
-    } else if (Array.isArray(resultObj) && typeof resultObj[0] === "string") {
-      rawContent = resultObj[0];
-    } else if (resultObj && typeof resultObj === "object") {
-      rawContent = JSON.stringify(resultObj);
-    }
+    const rawContent = await chatText(apiKey, openAiBody, payload, legacyOnly);
 
     const cleanContent = ResponseSanitizer.cleanOutput(rawContent);
     const promptTokens = calculateTokens(prompt);

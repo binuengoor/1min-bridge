@@ -7,8 +7,10 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { getModelData } from "../model-registry.js";
 import {
-  callChat,
-  callChatStream,
+  chatText,
+  chatTextStream,
+  toPlainOpenAiMessages,
+  type OpenAiChatBody,
 } from "../adapters/onemin.js";
 import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
 import {
@@ -330,9 +332,25 @@ app.post("/v1/messages", async (c) => {
     },
   };
 
+  // Anthropic requests are translated into OpenAI chat completions against the
+  // 1min.ai OpenAI upstream (ReAct-emulated tools; legacy endpoint as fallback).
+  const openAiBody: OpenAiChatBody = {
+    model: cleanModel,
+    messages: toPlainOpenAiMessages(internalMessages),
+    ...(body.max_tokens ? { max_tokens: body.max_tokens } : {}),
+    ...(typeof mExtra.temperature === "number" ? { temperature: mExtra.temperature } : {}),
+    ...(typeof mExtra.top_p === "number" ? { top_p: mExtra.top_p } : {}),
+  };
+  // Legacy-only features (web search, brand voice, memories, ...) skip the OpenAI upstream.
+  const legacyOnly =
+    webSearch ||
+    ["brandVoiceId", "conversationId", "numOfSite", "maxWord", "historyMessageLimit", "withMemories"].some(
+      (k) => mExtra[k] !== undefined,
+    );
+
   try {
     if (stream) {
-      const streamBody = await callChatStream(apiKey, payload);
+      const streamBody = await chatTextStream(apiKey, openAiBody, payload, legacyOnly);
       const encoder = new TextEncoder();
       const inputTokens = calculateTokens(prompt);
 
@@ -547,16 +565,7 @@ app.post("/v1/messages", async (c) => {
     }
 
     // Non-streaming response
-    const data = await callChat(apiKey, payload);
-    const resultObj = data.aiRecord?.aiRecordDetail?.resultObject;
-    let rawContent = "";
-    if (typeof resultObj === "string") {
-      rawContent = resultObj;
-    } else if (Array.isArray(resultObj) && typeof resultObj[0] === "string") {
-      rawContent = resultObj[0];
-    } else if (resultObj && typeof resultObj === "object") {
-      rawContent = JSON.stringify(resultObj);
-    }
+    const rawContent = await chatText(apiKey, openAiBody, payload, legacyOnly);
 
     const toolCalls = hasTools
       ? ToolCallingEmulator.parseResponseWithFallback(

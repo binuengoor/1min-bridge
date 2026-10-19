@@ -408,6 +408,58 @@ Tool: [{"result": "ok"}]`;
   assert.ok(dashHtml.includes("tab-credits"));
   console.log("  ✅ Credit calculations and live Web Dashboard verified.\n");
 
+  // --------------------------------------------------------------------------
+  // Test: OpenAI upstream adapter helpers
+  // --------------------------------------------------------------------------
+  console.log("Test: OpenAI upstream adapter (native tool routing, SSE adaptation)...");
+  const oa = await import("../src/adapters/onemin.js");
+  assert.ok(oa.supportsNativeTools("gpt-4o-mini"));
+  assert.ok(oa.supportsNativeTools("claude-3-5-sonnet-20241022"));
+  assert.ok(oa.supportsNativeTools("gemini-2.0-flash"));
+  assert.ok(!oa.supportsNativeTools("qwen3.7-flash"));
+  assert.ok(!oa.supportsNativeTools("deepseek-chat"));
+
+  const plain = oa.toPlainOpenAiMessages([
+    { role: "developer", content: "be terse" },
+    { role: "user", content: "hi" },
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{\"a\":1}" } }] },
+    { role: "tool", content: "42", tool_call_id: "c1" },
+  ] as any);
+  assert.deepStrictEqual(plain.map((m) => m.role), ["system", "user", "assistant", "user"]);
+  assert.ok(plain[2]!.content!.includes("f({\"a\":1})"));
+  assert.ok(plain[3]!.content!.includes("42"));
+
+  const native = oa.toNativeOpenAiMessages([
+    { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
+    { role: "tool", content: "ok", tool_call_id: "c1" },
+  ] as any);
+  assert.strictEqual(native[0]!.tool_calls![0]!.id, "c1");
+  assert.strictEqual(native[1]!.tool_call_id, "c1");
+
+  const sseText = [
+    'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+    'data: {"choices":[{"delta":{"content":"Hel"}}]}',
+    'data: {"choices":[{"delta":{"content":"lo"}}]}',
+    'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+    "data: [DONE]",
+    "",
+  ].join("\n\n");
+  const mkStream = () =>
+    new ReadableStream<Uint8Array>({
+      start(c) {
+        const bytes = new TextEncoder().encode(sseText);
+        c.enqueue(bytes.slice(0, 40)); // split mid-line to exercise buffering
+        c.enqueue(bytes.slice(40));
+        c.close();
+      },
+    });
+  const chunks: any[] = [];
+  for await (const ch of oa.iterateOpenAiSse(mkStream())) chunks.push(ch);
+  assert.strictEqual(chunks.length, 4);
+  const adapted = await new Response(oa.openAiStreamToTextStream(mkStream())).text();
+  assert.strictEqual(adapted, 'data: "Hel"\n\ndata: "lo"\n\ndata: [DONE]\n\n');
+  console.log("  ✅ OpenAI upstream adapter verified.\n");
+
   console.log("🎉 ALL VERIFICATION TESTS PASSED SUCCESSFULLY!\n");
   process.exit(0);
 }

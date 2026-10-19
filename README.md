@@ -256,6 +256,8 @@ http://localhost:3000/dashboard
 | Variable | Default | Description |
 |---|---|---|
 | `ONE_MIN_API_KEY` | — | Server-side default 1min.ai API key |
+| `ONE_MIN_OPENAI_ENABLED` | `true` | Use the OpenAI-compatible upstream (`/openai/v1/chat/completions`) as primary chat backend; `false` = legacy `/api/chat-with-ai` only |
+| `ONE_MIN_OPENAI_CHAT_URL` | `https://api.1min.ai/openai/v1/chat/completions` | OpenAI-compatible upstream endpoint |
 | `AUTH_TOKEN` | — | Master proxy token for client authentication |
 | `PORT` | `3000` | Server listening port (Node.js) |
 | `CACHE_TTL_MS` | `1800000` | Model catalog cache TTL in milliseconds (30 min) |

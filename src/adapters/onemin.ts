@@ -8,8 +8,10 @@ import type {
   OneMinRequestBody,
   OneMinResponse,
   OneMinAssetResponse,
+  ChatMessage,
+  ToolCall,
 } from "../types.js";
-import { upstreamError } from "../errors.js";
+import { upstreamError, RelayError } from "../errors.js";
 import { ResponseSanitizer } from "./sanitizer.js";
 
 const FETCH_TIMEOUT_MS = 120_000; // 2 min for generation requests
@@ -20,6 +22,363 @@ function buildHeaders(apiKey: string): Record<string, string> {
     "Content-Type": "application/json",
     "API-KEY": apiKey,
   };
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI-compatible upstream (POST /openai/v1/chat/completions)
+// ---------------------------------------------------------------------------
+
+export interface OpenAiUpstreamMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_calls?: ToolCall[];
+  tool_call_id?: string;
+  name?: string;
+}
+
+export interface OpenAiChatBody {
+  model: string;
+  messages: OpenAiUpstreamMessage[];
+  stream?: boolean;
+  temperature?: number;
+  max_tokens?: number;
+  top_p?: number;
+  frequency_penalty?: number;
+  presence_penalty?: number;
+  stop?: string | string[];
+  tools?: unknown[];
+  tool_choice?: unknown;
+}
+
+export interface OpenAiChatCompletion {
+  id?: string;
+  model?: string;
+  choices?: {
+    index?: number;
+    message?: {
+      role?: string;
+      content?: string | null;
+      tool_calls?: ToolCall[];
+    };
+    finish_reason?: string | null;
+  }[];
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+}
+
+export interface OpenAiChatChunk {
+  id?: string;
+  model?: string;
+  choices?: {
+    index?: number;
+    delta?: {
+      role?: string;
+      content?: string | null;
+      tool_calls?: {
+        index: number;
+        id?: string;
+        type?: string;
+        function?: { name?: string; arguments?: string };
+      }[];
+    };
+    finish_reason?: string | null;
+  }[];
+  usage?: OpenAiChatCompletion["usage"];
+  error?: { message?: string };
+}
+
+/**
+ * Model families verified to execute native OpenAI tool calls upstream.
+ * Everything else (Qwen, DeepSeek, Mistral, ...) uses the ReAct emulator.
+ */
+const NATIVE_TOOL_MODEL_PREFIXES = [
+  "gpt-4o",
+  "claude-3-5-",
+  "gemini-1.5-",
+  "gemini-2.0-",
+];
+
+export function supportsNativeTools(model: string): boolean {
+  return NATIVE_TOOL_MODEL_PREFIXES.some((p) => model.startsWith(p));
+}
+
+function buildOpenAiHeaders(apiKey: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${apiKey}`,
+  };
+}
+
+/**
+ * Flatten bridge messages into plain role/content messages that any upstream
+ * model accepts: developer -> system, tool results and assistant tool calls ->
+ * prose (the ReAct emulator reads them back in this form).
+ */
+export function toPlainOpenAiMessages(
+  messages: ChatMessage[],
+): OpenAiUpstreamMessage[] {
+  const out: OpenAiUpstreamMessage[] = [];
+  for (const m of messages) {
+    if (m.role === "tool" || m.role === "function") {
+      const clean = ResponseSanitizer.unpackMemoryContent(m.content);
+      const prefix = m.tool_call_id
+        ? `[System Context - Retrieved Tool Result for ${m.tool_call_id}]:`
+        : `[System Context - Retrieved Tool Result]:`;
+      out.push({ role: "user", content: `${prefix}\n${clean}` });
+      continue;
+    }
+    if (
+      m.role === "assistant" &&
+      Array.isArray(m.tool_calls) &&
+      m.tool_calls.length > 0
+    ) {
+      const calls = m.tool_calls
+        .map((tc) => {
+          const args = tc.function?.arguments ?? "{}";
+          return `${tc.function?.name || "unnamed_tool"}(${
+            typeof args === "string" ? args : JSON.stringify(args)
+          })`;
+        })
+        .join(", ");
+      out.push({ role: "assistant", content: `[Assistant called tool: ${calls}]` });
+      continue;
+    }
+    let text = "";
+    if (typeof m.content === "string") {
+      text = m.content;
+    } else if (Array.isArray(m.content)) {
+      text = m.content
+        .filter((p) => p && typeof p === "object" && p.type === "text")
+        .map((p) => p.text ?? "")
+        .join("\n");
+    } else if (m.content) {
+      text = ResponseSanitizer.unpackMemoryContent(m.content);
+    }
+    if (!text) continue;
+    out.push({
+      role:
+        m.role === "system" || m.role === "developer"
+          ? "system"
+          : m.role === "assistant"
+            ? "assistant"
+            : "user",
+      content: text,
+    });
+  }
+  return out;
+}
+
+/**
+ * Messages for native tool calling: keep tool / tool_calls structure intact
+ * (text parts only; vision is routed to the legacy endpoint).
+ */
+export function toNativeOpenAiMessages(
+  messages: ChatMessage[],
+): OpenAiUpstreamMessage[] {
+  return messages.map((m) => {
+    const role =
+      m.role === "developer"
+        ? "system"
+        : m.role === "function"
+          ? "tool"
+          : m.role;
+    let content: string | null;
+    if (typeof m.content === "string") content = m.content;
+    else if (Array.isArray(m.content))
+      content = m.content
+        .filter((p) => p && typeof p === "object" && p.type === "text")
+        .map((p) => p.text ?? "")
+        .join("\n");
+    else content = m.content ? ResponseSanitizer.unpackMemoryContent(m.content) : null;
+
+    const msg: OpenAiUpstreamMessage = { role: role as OpenAiUpstreamMessage["role"], content };
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      msg.tool_calls = m.tool_calls.map((tc, i) => ({
+        id: tc.id || `call_${i}`,
+        type: "function",
+        function: {
+          name: tc.function.name,
+          arguments:
+            typeof tc.function.arguments === "string"
+              ? tc.function.arguments
+              : JSON.stringify(tc.function.arguments ?? {}),
+        },
+      }));
+    }
+    if (m.tool_call_id) msg.tool_call_id = m.tool_call_id;
+    if (m.name && role !== "tool") msg.name = m.name;
+    return msg;
+  });
+}
+
+/** Non-streaming OpenAI chat call (POST /openai/v1/chat/completions) */
+export async function callOpenAiChat(
+  apiKey: string,
+  body: OpenAiChatBody,
+): Promise<OpenAiChatCompletion> {
+  const res = await fetch(config.oneMinOpenAiChatUrl, {
+    method: "POST",
+    headers: buildOpenAiHeaders(apiKey),
+    body: JSON.stringify({ ...body, stream: false }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw upstreamError(res.status, text);
+  }
+  return (await res.json()) as OpenAiChatCompletion;
+}
+
+/** Streaming OpenAI chat call; returns the raw upstream SSE byte stream. */
+export async function callOpenAiChatStream(
+  apiKey: string,
+  body: OpenAiChatBody,
+): Promise<ReadableStream<Uint8Array>> {
+  const res = await fetch(config.oneMinOpenAiChatUrl, {
+    method: "POST",
+    headers: buildOpenAiHeaders(apiKey),
+    body: JSON.stringify({ ...body, stream: true }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw upstreamError(res.status, text);
+  }
+  if (!res.body) {
+    throw upstreamError(500, "No response body from OpenAI chat stream");
+  }
+  return res.body;
+}
+
+/** Parse an OpenAI SSE byte stream into chat.completion.chunk objects. */
+export async function* iterateOpenAiSse(
+  stream: ReadableStream<Uint8Array>,
+): AsyncGenerator<OpenAiChatChunk> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const parseLine = (line: string): OpenAiChatChunk | null => {
+    const t = line.trim();
+    if (!t.startsWith("data:")) return null;
+    const data = t.slice(5).trim();
+    if (!data || data === "[DONE]") return null;
+    try {
+      return JSON.parse(data) as OpenAiChatChunk;
+    } catch {
+      return null;
+    }
+  };
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const chunk = parseLine(line);
+        if (chunk) {
+          if (chunk.error) {
+            throw upstreamError(502, chunk.error.message ?? "stream error");
+          }
+          yield chunk;
+        }
+      }
+    }
+    const last = parseLine(buffer);
+    if (last) yield last;
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
+ * Adapt an OpenAI SSE stream to the bridge's internal text stream
+ * (`data: "<text>"` lines) so the ReAct/sanitizer pipelines work unchanged.
+ */
+export function openAiStreamToTextStream(
+  raw: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for await (const chunk of iterateOpenAiSse(raw)) {
+          const text = chunk.choices?.[0]?.delta?.content;
+          if (typeof text === "string" && text && !ResponseSanitizer.isCrawlingStatus(text)) {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(text)}\n\n`));
+          }
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      } catch (err) {
+        console.error("OpenAI chat streaming error:", err);
+        controller.error(err);
+      }
+    },
+  });
+}
+
+/** Whether a failed OpenAI-upstream call should retry on the legacy endpoint. */
+export function shouldFallbackToLegacy(err: unknown): boolean {
+  if (!config.oneMinOpenAiEnabled) return false;
+  if (err instanceof RelayError) {
+    return ![401, 403, 429].includes(err.status);
+  }
+  return true; // network error / timeout
+}
+
+/** Extract assistant text from a legacy /api/chat-with-ai response. */
+export function extractLegacyText(data: OneMinResponse): string {
+  const resultObj = data.aiRecord?.aiRecordDetail?.resultObject;
+  if (typeof resultObj === "string") return resultObj;
+  if (Array.isArray(resultObj) && typeof resultObj[0] === "string") return resultObj[0];
+  if (resultObj && typeof resultObj === "object") return JSON.stringify(resultObj);
+  return "";
+}
+
+/**
+ * Text completion via the OpenAI upstream, falling back to the legacy
+ * endpoint when the provider rejects the request.
+ */
+export async function chatText(
+  apiKey: string,
+  body: OpenAiChatBody,
+  legacy: OneMinRequestBody,
+  legacyOnly = false,
+): Promise<string> {
+  if (config.oneMinOpenAiEnabled && !legacyOnly) {
+    try {
+      const res = await callOpenAiChat(apiKey, body);
+      const text = res.choices?.[0]?.message?.content;
+      if (typeof text === "string") return text;
+    } catch (err) {
+      if (!shouldFallbackToLegacy(err)) throw err;
+      console.warn("OpenAI upstream failed, falling back to legacy:", (err as Error).message);
+    }
+  }
+  return extractLegacyText(await callChat(apiKey, legacy));
+}
+
+/** Streaming counterpart of chatText; yields the internal text stream. */
+export async function chatTextStream(
+  apiKey: string,
+  body: OpenAiChatBody,
+  legacy: OneMinRequestBody,
+  legacyOnly = false,
+): Promise<ReadableStream<Uint8Array>> {
+  if (config.oneMinOpenAiEnabled && !legacyOnly) {
+    try {
+      return openAiStreamToTextStream(await callOpenAiChatStream(apiKey, body));
+    } catch (err) {
+      if (!shouldFallbackToLegacy(err)) throw err;
+      console.warn("OpenAI upstream stream failed, falling back to legacy:", (err as Error).message);
+    }
+  }
+  return callChatStream(apiKey, legacy);
 }
 
 /** Non-streaming Chat API call (POST /api/chat-with-ai) */
