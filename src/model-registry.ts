@@ -193,3 +193,31 @@ export async function isSpeechModel(model: string): Promise<boolean> {
   if (speechSet.size === 0) await getModelData();
   return speechSet.has(model);
 }
+
+/**
+ * Returns the top N lowest-cost active chat models from the catalog for resilient keep-alive pings.
+ */
+export async function getCheapestChatModels(limit = 3): Promise<string[]> {
+  const data = await getModelData();
+  const candidates = data.entries
+    .filter(
+      (m) =>
+        (m.status === "ACTIVE" || m.status === "active") &&
+        data.chatModelIds.includes(m.modelId),
+    )
+    .map((m) => {
+      const inputCost = typeof m.creditMetadata?.INPUT === "number" ? m.creditMetadata.INPUT : 999;
+      const outputCost = typeof m.creditMetadata?.OUTPUT === "number" ? m.creditMetadata.OUTPUT : 999;
+      return {
+        modelId: m.modelId,
+        cost: inputCost + outputCost,
+      };
+    })
+    .sort((a, b) => a.cost - b.cost);
+
+  const top = candidates.slice(0, limit).map((c) => c.modelId);
+  if (top.length === 0) {
+    return ["qwen3.7-flash", "open-mistral-nemo", "ministral-14b-latest"];
+  }
+  return top;
+}

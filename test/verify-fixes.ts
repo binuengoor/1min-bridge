@@ -368,9 +368,14 @@ Tool: [{"result": "ok"}]`;
   assert.strictEqual(typeof statusData.keepAlive.enabled, "boolean");
   assert.strictEqual(typeof statusData.keepAlive.intervalDays, "number");
 
+  const { getCheapestChatModels } = await import("../src/model-registry.js");
+  const cheapest = await getCheapestChatModels(3);
+  assert.ok(cheapest.length === 3, "getCheapestChatModels should return 3 candidates");
+  console.log(`  Cheapest models for keep-alive cascade: ${cheapest.join(" -> ")}`);
+
   const aliasStatusRes = await app.fetch(new Request("http://localhost:3000/api/checkin/status"));
   assert.strictEqual(aliasStatusRes.status, 200);
-  console.log("  ✅ Check-in status endpoints & keep-alive verified.\n");
+  console.log("  ✅ Check-in status endpoints & 3-model keep-alive cascade verified.\n");
 
   // --------------------------------------------------------------------------
   // Test 10: Credit Calculations, Stats API & Web Dashboard

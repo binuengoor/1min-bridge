@@ -5,6 +5,7 @@
 import { config } from "../config.js";
 import { OneMinCheckinClient } from "./client.js";
 import { dispatchCheckinNotification } from "./notifier.js";
+import { getCheapestChatModels } from "../model-registry.js";
 import type {
   CheckinConfig,
   CheckinResult,
@@ -185,71 +186,109 @@ export class CheckinScheduler {
 
   /**
    * Executes a minimal 1-token prompt to maintain 30-day lifetime credit eligibility.
+   * Dynamically evaluates the lowest-cost models and cascades across up to 3 candidates.
    */
   public async runKeepAliveNow(apiKeyOverride?: string): Promise<KeepAliveResult> {
     const apiKey = apiKeyOverride || config.defaultApiKey;
-    const model = this.config.keepAliveModel || "qwen3.7-flash";
 
     if (!apiKey) {
       const res: KeepAliveResult = {
         success: false,
         timestamp: new Date().toISOString(),
-        model,
+        model: "none",
         error: "Missing API key for keep-alive (ONE_MIN_API_KEY not configured)",
       };
       this.lastKeepAliveResult = res;
       return res;
     }
 
-    try {
-      console.log(`[Keep-Alive] Triggering 30-day lifetime credit keep-alive ping via ${model}...`);
-      const response = await fetch("https://api.1min.ai/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model,
-          messages: [{ role: "user", content: "keepalive" }],
-          max_tokens: 1,
-        }),
-        signal: AbortSignal.timeout(15_000),
-      });
+    // 1. Dynamically find the 3 cheapest active chat models from the live catalog
+    const cheapestModels = await getCheapestChatModels(3).catch(() => [
+      "qwen3.7-flash",
+      "open-mistral-nemo",
+      "ministral-14b-latest",
+    ]);
 
-      if (!response.ok) {
-        const errText = await response.text().catch(() => "");
-        throw new Error(`HTTP ${response.status}: ${errText.slice(0, 100)}`);
-      }
-
-      const data = (await response.json().catch(() => ({}))) as {
-        usage?: { total_tokens?: number };
-      };
-      const tokensUsed = data.usage?.total_tokens ?? 1;
-
-      console.log(
-        `[Keep-Alive] Successfully consumed minimal credits (${tokensUsed} tokens) on ${model} to maintain 30-day lifetime bonus eligibility.`,
-      );
-      const res: KeepAliveResult = {
-        success: true,
-        timestamp: new Date().toISOString(),
-        model,
-        tokensUsed,
-      };
-      this.lastKeepAliveResult = res;
-      return res;
-    } catch (err) {
-      const errorMsg = (err as Error).message;
-      console.warn(`[Keep-Alive] Failed to execute keep-alive ping: ${errorMsg}`);
-      const res: KeepAliveResult = {
-        success: false,
-        timestamp: new Date().toISOString(),
-        model,
-        error: errorMsg,
-      };
-      this.lastKeepAliveResult = res;
-      return res;
+    // Ensure candidates list is populated, prioritizing user preference if configured
+    const candidateSet = new Set<string>();
+    if (this.config.keepAliveModel && this.config.keepAliveModel !== "auto") {
+      candidateSet.add(this.config.keepAliveModel);
     }
+    for (const m of cheapestModels) {
+      candidateSet.add(m);
+    }
+    const candidates = Array.from(candidateSet).slice(0, 3);
+
+    console.log(
+      `[Keep-Alive] 3-model cascade candidates (lowest credit cost): ${candidates.join(" -> ")}`,
+    );
+
+    const errors: string[] = [];
+
+    // 2. Cascade down candidate models until one succeeds
+    for (let i = 0; i < candidates.length; i++) {
+      const model = candidates[i] || "qwen3.7-flash";
+      try {
+        console.log(
+          `[Keep-Alive] Attempt ${i + 1}/${candidates.length}: Sending 1-token ping to ${model}...`,
+        );
+
+        const response = await fetch("https://api.1min.ai/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            messages: [{ role: "user", content: "keepalive" }],
+            max_tokens: 1,
+          }),
+          signal: AbortSignal.timeout(15_000),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text().catch(() => "");
+          throw new Error(`HTTP ${response.status}: ${errText.slice(0, 100)}`);
+        }
+
+        const data = (await response.json().catch(() => ({}))) as {
+          usage?: { total_tokens?: number };
+        };
+        const tokensUsed = data.usage?.total_tokens ?? 1;
+
+        console.log(
+          `[Keep-Alive] Successfully consumed minimal credits (${tokensUsed} tokens) on ${model} to maintain 30-day lifetime bonus eligibility.`,
+        );
+
+        const res: KeepAliveResult = {
+          success: true,
+          timestamp: new Date().toISOString(),
+          model,
+          tokensUsed,
+        };
+        this.lastKeepAliveResult = res;
+        return res;
+      } catch (err) {
+        const errorMsg = (err as Error).message;
+        errors.push(`${model}: ${errorMsg}`);
+        console.warn(
+          `[Keep-Alive] Candidate ${i + 1}/${candidates.length} (${model}) failed: ${errorMsg}. Cascading to next model...`,
+        );
+      }
+    }
+
+    const summaryError = `All 3 cascade models failed: ${errors.join(" | ")}`;
+    console.error(`[Keep-Alive] ${summaryError}`);
+
+    const res: KeepAliveResult = {
+      success: false,
+      timestamp: new Date().toISOString(),
+      model: candidates[0] || "unknown",
+      error: summaryError,
+    };
+    this.lastKeepAliveResult = res;
+    return res;
   }
 
   /**
