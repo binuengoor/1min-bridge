@@ -442,6 +442,23 @@ export interface AppConfig {
 // Daily Check-in types
 // ---------------------------------------------------------------------------
 
+export interface KeepAliveResult {
+  success: boolean;
+  timestamp: string;
+  model: string;
+  tokensUsed?: number;
+  creditsUsed?: number;
+  error?: string;
+}
+
+export interface KeepAliveStatus {
+  enabled: boolean;
+  intervalDays: number;
+  model: string;
+  lastRun?: KeepAliveResult;
+  nextRunDue?: string;
+}
+
 export interface CheckinConfig {
   enabled: boolean;
   email?: string;
@@ -454,6 +471,9 @@ export interface CheckinConfig {
   telegramBotToken?: string;
   telegramChatId?: string;
   webhookUrl?: string;
+  keepAliveEnabled?: boolean; // Maintain 30-day lifetime bonus eligibility
+  keepAliveDays?: number; // Days between credit keep-alive pings (default 7)
+  keepAliveModel?: string; // Model to ping (default "qwen3.7-flash")
 }
 
 export interface CheckinResult {
@@ -479,6 +499,7 @@ export interface CheckinStatus {
   totalCheckins: number;
   successfulCheckins: number;
   history: CheckinResult[];
+  keepAlive?: KeepAliveStatus;
 }
 
 export interface OpenAIErrorBody {

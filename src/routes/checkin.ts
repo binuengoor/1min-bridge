@@ -43,10 +43,38 @@ const handleRun = async (c: any) => {
   });
 };
 
+/**
+ * Triggers an immediate keep-alive credit ping.
+ */
+const handleKeepAlive = async (c: any) => {
+  const scheduler = getCheckinScheduler();
+  const apiKey = c.get("oneMinApiKey");
+  const result = await scheduler.runKeepAliveNow(apiKey);
+
+  if (!result.success) {
+    return c.json(
+      {
+        success: false,
+        message: "Credit keep-alive failed",
+        result,
+      },
+      500,
+    );
+  }
+
+  return c.json({
+    success: true,
+    message: "Credit keep-alive succeeded",
+    result,
+  });
+};
+
 app.get("/v1/checkin/status", handleStatus);
 app.post("/v1/checkin/run", handleRun);
+app.post("/v1/checkin/keepalive", handleKeepAlive);
 
 app.get("/api/checkin/status", handleStatus);
 app.post("/api/checkin/run", handleRun);
+app.post("/api/checkin/keepalive", handleKeepAlive);
 
 export default app;

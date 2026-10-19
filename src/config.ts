@@ -39,6 +39,9 @@ const envSchema = z.object({
   CHECKIN_TELEGRAM_CHAT_ID: z.string().optional(),
   CHECKIN_WEBHOOK_URL: z.string().optional(),
   CHECKIN_SETTLE_MS: z.string().default("3000"),
+  CHECKIN_KEEP_ALIVE_ENABLED: z.string().default("true"),
+  CHECKIN_KEEP_ALIVE_DAYS: z.string().default("7"),
+  CHECKIN_KEEP_ALIVE_MODEL: z.string().default("qwen3.7-flash"),
 });
 
 function loadConfig(): AppConfig {
@@ -79,6 +82,9 @@ function loadConfig(): AppConfig {
       telegramBotToken: env.CHECKIN_TELEGRAM_BOT_TOKEN || undefined,
       telegramChatId: env.CHECKIN_TELEGRAM_CHAT_ID || undefined,
       webhookUrl: env.CHECKIN_WEBHOOK_URL || undefined,
+      keepAliveEnabled: env.CHECKIN_KEEP_ALIVE_ENABLED.toLowerCase() !== "false" && env.CHECKIN_KEEP_ALIVE_ENABLED !== "0",
+      keepAliveDays: parseInt(env.CHECKIN_KEEP_ALIVE_DAYS, 10) || 7,
+      keepAliveModel: env.CHECKIN_KEEP_ALIVE_MODEL || "qwen3.7-flash",
     },
   };
 }

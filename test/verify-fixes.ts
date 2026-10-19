@@ -364,10 +364,13 @@ Tool: [{"result": "ok"}]`;
   const statusData = await statusRes.json();
   assert.strictEqual(typeof statusData.enabled, "boolean");
   assert.ok(Array.isArray(statusData.history));
+  assert.ok(statusData.keepAlive, "statusData should include keepAlive");
+  assert.strictEqual(typeof statusData.keepAlive.enabled, "boolean");
+  assert.strictEqual(typeof statusData.keepAlive.intervalDays, "number");
 
   const aliasStatusRes = await app.fetch(new Request("http://localhost:3000/api/checkin/status"));
   assert.strictEqual(aliasStatusRes.status, 200);
-  console.log("  ✅ Check-in status endpoints verified.\n");
+  console.log("  ✅ Check-in status endpoints & keep-alive verified.\n");
 
   // --------------------------------------------------------------------------
   // Test 10: Credit Calculations, Stats API & Web Dashboard

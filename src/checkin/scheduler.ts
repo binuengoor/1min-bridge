@@ -5,7 +5,12 @@
 import { config } from "../config.js";
 import { OneMinCheckinClient } from "./client.js";
 import { dispatchCheckinNotification } from "./notifier.js";
-import type { CheckinConfig, CheckinResult, CheckinStatus } from "../types.js";
+import type {
+  CheckinConfig,
+  CheckinResult,
+  CheckinStatus,
+  KeepAliveResult,
+} from "../types.js";
 
 const MAX_HISTORY_LENGTH = 30;
 
@@ -28,6 +33,7 @@ export class CheckinScheduler {
   private history: CheckinResult[] = [];
   private totalCheckins = 0;
   private successfulCheckins = 0;
+  private lastKeepAliveResult?: KeepAliveResult;
 
   constructor(config: CheckinConfig) {
     this.config = config;
@@ -115,6 +121,21 @@ export class CheckinScheduler {
       // Dispatch Telegram / Webhook notification
       await dispatchCheckinNotification(this.config, result);
 
+      // Trigger periodic 30-day lifetime credit keep-alive ping if due
+      if (this.config.keepAliveEnabled) {
+        const intervalMs = (this.config.keepAliveDays ?? 7) * 24 * 60 * 60 * 1000;
+        const lastTimestamp = this.lastKeepAliveResult?.timestamp
+          ? new Date(this.lastKeepAliveResult.timestamp).getTime()
+          : 0;
+        const isDue = Date.now() - lastTimestamp >= intervalMs;
+
+        if (isDue) {
+          await this.runKeepAliveNow().catch((err) => {
+            console.warn("[Check-in Scheduler] Keep-alive invocation warning:", err);
+          });
+        }
+      }
+
       return result;
     } finally {
       this.isExecuting = false;
@@ -163,10 +184,86 @@ export class CheckinScheduler {
   }
 
   /**
+   * Executes a minimal 1-token prompt to maintain 30-day lifetime credit eligibility.
+   */
+  public async runKeepAliveNow(apiKeyOverride?: string): Promise<KeepAliveResult> {
+    const apiKey = apiKeyOverride || config.defaultApiKey;
+    const model = this.config.keepAliveModel || "qwen3.7-flash";
+
+    if (!apiKey) {
+      const res: KeepAliveResult = {
+        success: false,
+        timestamp: new Date().toISOString(),
+        model,
+        error: "Missing API key for keep-alive (ONE_MIN_API_KEY not configured)",
+      };
+      this.lastKeepAliveResult = res;
+      return res;
+    }
+
+    try {
+      console.log(`[Keep-Alive] Triggering 30-day lifetime credit keep-alive ping via ${model}...`);
+      const response = await fetch("https://api.1min.ai/openai/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: "keepalive" }],
+          max_tokens: 1,
+        }),
+        signal: AbortSignal.timeout(15_000),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        throw new Error(`HTTP ${response.status}: ${errText.slice(0, 100)}`);
+      }
+
+      const data = (await response.json().catch(() => ({}))) as {
+        usage?: { total_tokens?: number };
+      };
+      const tokensUsed = data.usage?.total_tokens ?? 1;
+
+      console.log(
+        `[Keep-Alive] Successfully consumed minimal credits (${tokensUsed} tokens) on ${model} to maintain 30-day lifetime bonus eligibility.`,
+      );
+      const res: KeepAliveResult = {
+        success: true,
+        timestamp: new Date().toISOString(),
+        model,
+        tokensUsed,
+      };
+      this.lastKeepAliveResult = res;
+      return res;
+    } catch (err) {
+      const errorMsg = (err as Error).message;
+      console.warn(`[Keep-Alive] Failed to execute keep-alive ping: ${errorMsg}`);
+      const res: KeepAliveResult = {
+        success: false,
+        timestamp: new Date().toISOString(),
+        model,
+        error: errorMsg,
+      };
+      this.lastKeepAliveResult = res;
+      return res;
+    }
+  }
+
+  /**
    * Returns the current status of the check-in service.
    */
   public getStatus(): CheckinStatus {
     const isConfigured = Boolean(this.config.email && this.config.password);
+    const keepAliveDays = this.config.keepAliveDays ?? 7;
+    const nextKeepAliveDue = this.lastKeepAliveResult?.timestamp
+      ? new Date(
+          new Date(this.lastKeepAliveResult.timestamp).getTime() +
+            keepAliveDays * 24 * 60 * 60 * 1000,
+        ).toISOString()
+      : undefined;
 
     return {
       enabled: this.config.enabled,
@@ -177,6 +274,13 @@ export class CheckinScheduler {
       totalCheckins: this.totalCheckins,
       successfulCheckins: this.successfulCheckins,
       history: this.history,
+      keepAlive: {
+        enabled: Boolean(this.config.keepAliveEnabled),
+        intervalDays: keepAliveDays,
+        model: this.config.keepAliveModel ?? "qwen3.7-flash",
+        lastRun: this.lastKeepAliveResult,
+        nextRunDue: nextKeepAliveDue,
+      },
     };
   }
 }
