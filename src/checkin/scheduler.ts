@@ -6,6 +6,7 @@ import { config } from "../config.js";
 import { OneMinCheckinClient } from "./client.js";
 import { dispatchCheckinNotification } from "./notifier.js";
 import { getCheapestChatModels } from "../model-registry.js";
+import { getEndpointModels } from "../upstream/core.js";
 import type {
   CheckinConfig,
   CheckinResult,
@@ -203,15 +204,24 @@ export class CheckinScheduler {
     }
 
     // 1. Dynamically find the 3 cheapest active chat models from the live catalog
-    const cheapestModels = await getCheapestChatModels(3).catch(() => [
+    // Rank a wider pool, then keep only models the OpenAI endpoint serves (the
+    // ping goes there), so a model dropped from it is skipped automatically.
+    const ranked = await getCheapestChatModels(15).catch(() => [
       "qwen3.7-flash",
       "open-mistral-nemo",
       "ministral-14b-latest",
     ]);
+    const endpointModels = await getEndpointModels(apiKey).catch(() => null);
+    const servable = endpointModels ? ranked.filter((m) => endpointModels.has(m)) : ranked;
+    const cheapestModels = (servable.length > 0 ? servable : ranked).slice(0, 3);
 
     // Ensure candidates list is populated, prioritizing user preference if configured
     const candidateSet = new Set<string>();
-    if (this.config.keepAliveModel && this.config.keepAliveModel !== "auto") {
+    if (
+      this.config.keepAliveModel &&
+      this.config.keepAliveModel !== "auto" &&
+      (!endpointModels || endpointModels.has(this.config.keepAliveModel))
+    ) {
       candidateSet.add(this.config.keepAliveModel);
     }
     for (const m of cheapestModels) {

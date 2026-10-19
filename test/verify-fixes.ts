@@ -413,11 +413,53 @@ Tool: [{"result": "ok"}]`;
   // --------------------------------------------------------------------------
   console.log("Test: OpenAI upstream adapter (native tool routing, SSE adaptation)...");
   const oa = await import("../src/adapters/onemin.js");
-  assert.ok(oa.supportsNativeTools("gpt-4o-mini"));
-  assert.ok(oa.supportsNativeTools("claude-3-5-sonnet-20241022"));
-  assert.ok(oa.supportsNativeTools("gemini-2.0-flash"));
-  assert.ok(!oa.supportsNativeTools("qwen3.7-flash"));
-  assert.ok(!oa.supportsNativeTools("deepseek-chat"));
+  const core = await import("../src/upstream/core.js");
+  core._setEndpointModels(["gpt-4o-mini", "qwen3.7-flash"]);
+  assert.ok(await oa.routeViaOpenAi("k", "gpt-4o-mini"));
+  assert.ok(await oa.routeViaOpenAi("k", "qwen3.7-flash"), "all endpoint models route natively");
+  assert.ok(!(await oa.routeViaOpenAi("k", "claude-3-5-sonnet-20241022")), "models off the endpoint use legacy");
+  core.markModelUnsupported("gpt-4o-mini");
+  assert.ok(!(await oa.routeViaOpenAi("k", "gpt-4o-mini")), "open breaker routes to legacy");
+  core.recordUpstreamSuccess("gpt-4o-mini");
+  assert.ok(await oa.routeViaOpenAi("k", "gpt-4o-mini"));
+  core.recordUpstreamFailure("qwen3.7-flash");
+  core.recordUpstreamFailure("qwen3.7-flash");
+  assert.ok(!core.breakerOpen("qwen3.7-flash"), "breaker stays closed below threshold");
+  core.recordUpstreamFailure("qwen3.7-flash");
+  assert.ok(core.breakerOpen("qwen3.7-flash"), "breaker opens after 3 failures");
+  core.recordUpstreamSuccess("qwen3.7-flash");
+
+  // Parallel tool calls merge into one assistant message
+  const merged = oa.toNativeOpenAiMessages([
+    { role: "assistant", content: "", tool_calls: [{ id: "a", type: "function", function: { name: "f", arguments: "{}" } }] },
+    { role: "assistant", content: "", tool_calls: [{ id: "b", type: "function", function: { name: "g", arguments: "{}" } }] },
+    { role: "tool", content: "1", tool_call_id: "a" },
+    { role: "tool", content: "2", tool_call_id: "b" },
+  ] as any);
+  assert.strictEqual(merged.length, 3);
+  assert.strictEqual(merged[0]!.tool_calls!.length, 2);
+  assert.strictEqual(oa.toNativeToolChoice({ type: "any" }), "required");
+  assert.deepStrictEqual(oa.toNativeToolChoice({ type: "tool", name: "f" }), { type: "function", function: { name: "f" } });
+
+  // Response cache: modes, LRU/TTL, coalescing
+  const rc = await import("../src/cache/response-cache.js");
+  const hdr = (o: Record<string, string>) => ({ get: (n: string) => o[n.toLowerCase()] ?? null });
+  assert.ok(rc.resolveCacheMode(hdr({}), 0));
+  assert.ok(!rc.resolveCacheMode(hdr({}), 0.7), "non-deterministic requests bypass by default");
+  assert.ok(rc.resolveCacheMode(hdr({ "x-bridge-cache": "on" }), 0.7));
+  assert.ok(!rc.resolveCacheMode(hdr({ "x-bridge-cache": "bypass" }), 0));
+  assert.ok(!rc.resolveCacheMode(hdr({ "cache-control": "no-cache" }), 0));
+  rc._cacheClear();
+  let computes = 0;
+  const k1 = rc.cacheKey({ a: 1 });
+  assert.notStrictEqual(k1, rc.cacheKey({ a: 2 }));
+  const slow = async () => { computes++; await new Promise((r) => setTimeout(r, 30)); return { content: "x", toolCalls: null, finishReason: "stop" }; };
+  const [r1, r2] = await Promise.all([rc.cacheGetOrCompute(k1, slow), rc.cacheGetOrCompute(k1, slow)]);
+  assert.strictEqual(computes, 1, "identical in-flight requests coalesce");
+  assert.deepStrictEqual([r1.status, r2.status].sort(), ["COALESCED", "MISS"]);
+  assert.strictEqual((await rc.cacheGetOrCompute(k1, slow)).status, "HIT");
+  assert.strictEqual(computes, 1);
+  console.log("  ✅ Routing, breaker, message merge and response cache verified.\n");
 
   const plain = oa.toPlainOpenAiMessages([
     { role: "developer", content: "be terse" },

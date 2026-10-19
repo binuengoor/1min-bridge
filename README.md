@@ -257,6 +257,10 @@ http://localhost:3000/dashboard
 |---|---|---|
 | `ONE_MIN_API_KEY` | — | Server-side default 1min.ai API key |
 | `ONE_MIN_OPENAI_ENABLED` | `true` | Use the OpenAI-compatible upstream (`/openai/v1/chat/completions`) as primary chat backend; `false` = legacy `/api/chat-with-ai` only |
+| `ONE_MIN_UPSTREAM_RPM` | `55` | Upstream requests/minute per key (1min.ai allows 60); excess requests queue up to `ONE_MIN_UPSTREAM_MAX_WAIT_MS` (20000) then get 429 |
+| `ONE_MIN_UPSTREAM_RETRIES` | `2` | Retries on 429/5xx/network errors (jittered backoff) |
+| `ONE_MIN_STREAM_IDLE_MS` | `60000` | Abort a stream that is silent this long (no fixed total cap) |
+| `RESPONSE_CACHE_ENABLED` / `RESPONSE_CACHE_TTL_S` / `RESPONSE_CACHE_MAX_ENTRIES` | `true` / `600` / `500` | In-memory response cache. Used for `temperature: 0` requests, or any request with `X-Bridge-Cache: on`; skip with `X-Bridge-Cache: bypass` or `Cache-Control: no-cache`. Responses carry `X-Bridge-Cache: HIT\|MISS\|COALESCED` and `X-Bridge-Route: openai\|legacy\|cache`. 1min.ai bills cached prompt tokens at full price, so this is the only credit saver |
 | `ONE_MIN_OPENAI_CHAT_URL` | `https://api.1min.ai/openai/v1/chat/completions` | OpenAI-compatible upstream endpoint |
 | `AUTH_TOKEN` | — | Master proxy token for client authentication |
 | `PORT` | `3000` | Server listening port (Node.js) |

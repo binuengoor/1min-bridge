@@ -50,6 +50,16 @@ export class ResponseSanitizer {
     return out;
   }
 
+  /** Removes only reasoning blocks (<think> etc.), incl. unclosed ones. */
+  static stripReasoning(text: string): string {
+    if (!text || typeof text !== "string") return "";
+    const stripped = text.replace(
+      /<(think|thinking|reasoning|thought)[^>]*>[\s\S]*?(<\/\1>|$)/gi,
+      "",
+    );
+    return stripped === text ? text : stripped.trim();
+  }
+
   /**
    * Sanitizes the final assistant response removing execution artifacts,
    * thinking monologue (<think>), residual tool markup, and unwanted prefixes.

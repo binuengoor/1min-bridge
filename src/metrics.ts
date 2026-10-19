@@ -32,6 +32,7 @@ function serializeLabels(labels: Record<string, string>): string {
 export function incrementCounter(
   name: string,
   labels: Record<string, string>,
+  by = 1,
 ): void {
   let metricMap = counters.get(name);
   if (!metricMap) {
@@ -42,9 +43,9 @@ export function incrementCounter(
   const key = serializeLabels(labels);
   const existing = metricMap.get(key);
   if (existing) {
-    existing.value++;
+    existing.value += by;
   } else {
-    metricMap.set(key, { labels, value: 1 });
+    metricMap.set(key, { labels, value: by });
   }
 }
 

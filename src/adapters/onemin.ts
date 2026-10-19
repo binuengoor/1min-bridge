@@ -12,6 +12,17 @@ import type {
   ToolCall,
 } from "../types.js";
 import { upstreamError, RelayError } from "../errors.js";
+import {
+  openAiFetch,
+  withIdleTimeout,
+  getEndpointModels,
+  breakerOpen,
+  recordUpstreamSuccess,
+  recordUpstreamFailure,
+  markModelUnsupported,
+} from "../upstream/core.js";
+import { incrementCounter } from "../metrics.js";
+import type { ToolDefinition } from "./tool-emulator.js";
 import { ResponseSanitizer } from "./sanitizer.js";
 
 const FETCH_TIMEOUT_MS = 120_000; // 2 min for generation requests
@@ -40,14 +51,23 @@ export interface OpenAiChatBody {
   model: string;
   messages: OpenAiUpstreamMessage[];
   stream?: boolean;
+  stream_options?: { include_usage: boolean };
   temperature?: number;
   max_tokens?: number;
   top_p?: number;
   frequency_penalty?: number;
   presence_penalty?: number;
   stop?: string | string[];
+  response_format?: Record<string, unknown>;
   tools?: unknown[];
   tool_choice?: unknown;
+}
+
+export interface OpenAiUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
 }
 
 export interface OpenAiChatCompletion {
@@ -62,11 +82,7 @@ export interface OpenAiChatCompletion {
     };
     finish_reason?: string | null;
   }[];
-  usage?: {
-    prompt_tokens?: number;
-    completion_tokens?: number;
-    total_tokens?: number;
-  };
+  usage?: OpenAiUsage;
 }
 
 export interface OpenAiChatChunk {
@@ -86,30 +102,51 @@ export interface OpenAiChatChunk {
     };
     finish_reason?: string | null;
   }[];
-  usage?: OpenAiChatCompletion["usage"];
+  usage?: OpenAiUsage;
   error?: { message?: string };
 }
 
 /**
- * Model families verified to execute native OpenAI tool calls upstream.
- * Everything else (Qwen, DeepSeek, Mistral, ...) uses the ReAct emulator.
+ * Should this model be served by the OpenAI-compatible upstream? True when the
+ * endpoint is enabled, the model is on the endpoint's (cached) model list, and
+ * its circuit breaker is closed. Every model on that list was verified to
+ * execute native tool calls; anything else goes to the legacy endpoint.
  */
-const NATIVE_TOOL_MODEL_PREFIXES = [
-  "gpt-4o",
-  "claude-3-5-",
-  "gemini-1.5-",
-  "gemini-2.0-",
-];
-
-export function supportsNativeTools(model: string): boolean {
-  return NATIVE_TOOL_MODEL_PREFIXES.some((p) => model.startsWith(p));
+export async function routeViaOpenAi(apiKey: string, model: string): Promise<boolean> {
+  if (!config.oneMinOpenAiEnabled) return false;
+  if (breakerOpen(model)) return false;
+  const models = await getEndpointModels(apiKey);
+  return models === null || models.has(model); // unknown list => optimistic
 }
 
-function buildOpenAiHeaders(apiKey: string): Record<string, string> {
-  return {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
-  };
+/** Update breaker state and metrics after an OpenAI-upstream attempt. */
+export function noteOpenAiOutcome(model: string, err?: unknown): void {
+  if (!err) {
+    recordUpstreamSuccess(model);
+    incrementCounter("1min_bridge_upstream_requests_total", { route: "openai", result: "ok" });
+    return;
+  }
+  const status = err instanceof RelayError ? err.status : 0;
+  if (err instanceof RelayError && err.code === "model_not_found") {
+    markModelUnsupported(model);
+  } else if (status === 0 || status >= 500 || status === 429) {
+    recordUpstreamFailure(model);
+  }
+  incrementCounter("1min_bridge_upstream_requests_total", {
+    route: "openai",
+    result: `error_${status || "network"}`,
+  });
+}
+
+/** Count prompt/cached tokens so cache effectiveness is visible in /metrics. */
+export function recordUsageMetrics(model: string, usage?: OpenAiUsage): void {
+  if (!usage) return;
+  incrementCounter("1min_bridge_prompt_tokens_total", { model }, usage.prompt_tokens ?? 0);
+  incrementCounter(
+    "1min_bridge_cached_prompt_tokens_total",
+    { model },
+    usage.prompt_tokens_details?.cached_tokens ?? 0,
+  );
 }
 
 /**
@@ -178,7 +215,7 @@ export function toPlainOpenAiMessages(
 export function toNativeOpenAiMessages(
   messages: ChatMessage[],
 ): OpenAiUpstreamMessage[] {
-  return messages.map((m) => {
+  const mapped = messages.map((m) => {
     const role =
       m.role === "developer"
         ? "system"
@@ -212,6 +249,63 @@ export function toNativeOpenAiMessages(
     if (m.name && role !== "tool") msg.name = m.name;
     return msg;
   });
+
+  // Parallel tool calls arrive as several assistant messages; the OpenAI
+  // schema wants them merged into one assistant message before the results.
+  const out: OpenAiUpstreamMessage[] = [];
+  for (const msg of mapped) {
+    const prev = out[out.length - 1];
+    if (
+      prev &&
+      prev.role === "assistant" &&
+      msg.role === "assistant" &&
+      prev.tool_calls?.length &&
+      msg.tool_calls?.length &&
+      !msg.content
+    ) {
+      prev.tool_calls.push(...msg.tool_calls);
+      continue;
+    }
+    out.push(msg);
+  }
+  return out;
+}
+
+/** Normalise OpenAI/Anthropic-style tool defs to OpenAI `tools` entries. */
+export function toNativeTools(tools: ToolDefinition[]): unknown[] {
+  return tools.map((t) => ({
+    type: "function",
+    function: {
+      name: t.function?.name || t.name || "unnamed_tool",
+      description: t.function?.description || t.description || "",
+      parameters: t.function?.parameters ||
+        t.parameters ||
+        t.input_schema || { type: "object", properties: {} },
+    },
+  }));
+}
+
+export function toNativeToolChoice(choice: unknown): unknown {
+  if (choice === undefined) return undefined;
+  if (typeof choice === "string") return choice;
+  if (typeof choice === "object" && choice !== null) {
+    const c = choice as { type?: string; name?: string; function?: { name?: string } };
+    if (c.type === "any") return "required";
+    if (c.type === "auto") return "auto";
+    if (c.function?.name) return { type: "function", function: { name: c.function.name } };
+    if (c.type === "tool" && c.name) return { type: "function", function: { name: c.name } };
+  }
+  return undefined;
+}
+
+/** True when the caller insists on a tool call (retry via ReAct is allowed). */
+export function forcesToolCall(choice: unknown): boolean {
+  if (choice === "required") return true;
+  if (typeof choice === "object" && choice !== null) {
+    const c = choice as { type?: string; function?: unknown };
+    return c.type === "any" || c.type === "tool" || Boolean(c.function);
+  }
+  return false;
 }
 
 /** Non-streaming OpenAI chat call (POST /openai/v1/chat/completions) */
@@ -219,17 +313,20 @@ export async function callOpenAiChat(
   apiKey: string,
   body: OpenAiChatBody,
 ): Promise<OpenAiChatCompletion> {
-  const res = await fetch(config.oneMinOpenAiChatUrl, {
-    method: "POST",
-    headers: buildOpenAiHeaders(apiKey),
-    body: JSON.stringify({ ...body, stream: false }),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw upstreamError(res.status, text);
+  try {
+    const res = await openAiFetch(
+      apiKey,
+      { ...body, stream: false },
+      { stream: false, totalTimeoutMs: FETCH_TIMEOUT_MS },
+    );
+    const data = (await res.json()) as OpenAiChatCompletion;
+    noteOpenAiOutcome(body.model);
+    recordUsageMetrics(body.model, data.usage);
+    return data;
+  } catch (err) {
+    noteOpenAiOutcome(body.model, err);
+    throw err;
   }
-  return (await res.json()) as OpenAiChatCompletion;
 }
 
 /** Streaming OpenAI chat call; returns the raw upstream SSE byte stream. */
@@ -237,20 +334,19 @@ export async function callOpenAiChatStream(
   apiKey: string,
   body: OpenAiChatBody,
 ): Promise<ReadableStream<Uint8Array>> {
-  const res = await fetch(config.oneMinOpenAiChatUrl, {
-    method: "POST",
-    headers: buildOpenAiHeaders(apiKey),
-    body: JSON.stringify({ ...body, stream: true }),
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw upstreamError(res.status, text);
+  try {
+    const res = await openAiFetch(
+      apiKey,
+      { ...body, stream: true, stream_options: { include_usage: true } },
+      { stream: true },
+    );
+    if (!res.body) throw upstreamError(500, "No response body from OpenAI chat stream");
+    noteOpenAiOutcome(body.model);
+    return withIdleTimeout(res.body);
+  } catch (err) {
+    noteOpenAiOutcome(body.model, err);
+    throw err;
   }
-  if (!res.body) {
-    throw upstreamError(500, "No response body from OpenAI chat stream");
-  }
-  return res.body;
 }
 
 /** Parse an OpenAI SSE byte stream into chat.completion.chunk objects. */
@@ -342,25 +438,35 @@ export function extractLegacyText(data: OneMinResponse): string {
 
 /**
  * Text completion via the OpenAI upstream, falling back to the legacy
- * endpoint when the provider rejects the request.
+ * endpoint when the model is not served there or the provider rejects it.
  */
+export async function chatTextFull(
+  apiKey: string,
+  body: OpenAiChatBody,
+  legacy: OneMinRequestBody,
+  legacyOnly = false,
+): Promise<{ text: string; usage?: OpenAiUsage }> {
+  if (!legacyOnly && (await routeViaOpenAi(apiKey, body.model))) {
+    try {
+      const res = await callOpenAiChat(apiKey, body);
+      const text = res.choices?.[0]?.message?.content;
+      if (typeof text === "string") return { text, usage: res.usage };
+    } catch (err) {
+      if (!shouldFallbackToLegacy(err)) throw err;
+      console.warn("OpenAI upstream failed, falling back to legacy:", (err as Error).message);
+    }
+  }
+  incrementCounter("1min_bridge_upstream_requests_total", { route: "legacy", result: "ok" });
+  return { text: extractLegacyText(await callChat(apiKey, legacy)) };
+}
+
 export async function chatText(
   apiKey: string,
   body: OpenAiChatBody,
   legacy: OneMinRequestBody,
   legacyOnly = false,
 ): Promise<string> {
-  if (config.oneMinOpenAiEnabled && !legacyOnly) {
-    try {
-      const res = await callOpenAiChat(apiKey, body);
-      const text = res.choices?.[0]?.message?.content;
-      if (typeof text === "string") return text;
-    } catch (err) {
-      if (!shouldFallbackToLegacy(err)) throw err;
-      console.warn("OpenAI upstream failed, falling back to legacy:", (err as Error).message);
-    }
-  }
-  return extractLegacyText(await callChat(apiKey, legacy));
+  return (await chatTextFull(apiKey, body, legacy, legacyOnly)).text;
 }
 
 /** Streaming counterpart of chatText; yields the internal text stream. */
@@ -370,7 +476,7 @@ export async function chatTextStream(
   legacy: OneMinRequestBody,
   legacyOnly = false,
 ): Promise<ReadableStream<Uint8Array>> {
-  if (config.oneMinOpenAiEnabled && !legacyOnly) {
+  if (!legacyOnly && (await routeViaOpenAi(apiKey, body.model))) {
     try {
       return openAiStreamToTextStream(await callOpenAiChatStream(apiKey, body));
     } catch (err) {
@@ -378,6 +484,7 @@ export async function chatTextStream(
       console.warn("OpenAI upstream stream failed, falling back to legacy:", (err as Error).message);
     }
   }
+  incrementCounter("1min_bridge_upstream_requests_total", { route: "legacy", result: "ok" });
   return callChatStream(apiKey, legacy);
 }
 

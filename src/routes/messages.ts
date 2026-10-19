@@ -7,9 +7,19 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { getModelData } from "../model-registry.js";
 import {
-  chatText,
-  chatTextStream,
-  toPlainOpenAiMessages,
+  callOpenAiChat,
+  callOpenAiChatStream,
+  callChat,
+  callChatStream,
+  extractLegacyText,
+  forcesToolCall,
+  iterateOpenAiSse,
+  recordUsageMetrics,
+  routeViaOpenAi,
+  shouldFallbackToLegacy,
+  toNativeOpenAiMessages,
+  toNativeToolChoice,
+  toNativeTools,
   type OpenAiChatBody,
 } from "../adapters/onemin.js";
 import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
@@ -279,6 +289,8 @@ app.post("/v1/messages", async (c) => {
     system,
   );
 
+  const baseMessages = internalMessages; // pre-ReAct-injection, for native tools
+
   const isToolChoiceNone =
     (tool_choice as unknown) === "none" ||
     (typeof tool_choice === "object" &&
@@ -333,24 +345,206 @@ app.post("/v1/messages", async (c) => {
   };
 
   // Anthropic requests are translated into OpenAI chat completions against the
-  // 1min.ai OpenAI upstream (ReAct-emulated tools; legacy endpoint as fallback).
-  const openAiBody: OpenAiChatBody = {
-    model: cleanModel,
-    messages: toPlainOpenAiMessages(internalMessages),
-    ...(body.max_tokens ? { max_tokens: body.max_tokens } : {}),
-    ...(typeof mExtra.temperature === "number" ? { temperature: mExtra.temperature } : {}),
-    ...(typeof mExtra.top_p === "number" ? { top_p: mExtra.top_p } : {}),
-  };
-  // Legacy-only features (web search, brand voice, memories, ...) skip the OpenAI upstream.
+  // 1min.ai OpenAI upstream (native tools). Legacy-only features and models the
+  // endpoint does not serve use /api/chat-with-ai with ReAct-emulated tools.
   const legacyOnly =
     webSearch ||
     ["brandVoiceId", "conversationId", "numOfSite", "maxWord", "historyMessageLimit", "withMemories"].some(
       (k) => mExtra[k] !== undefined,
     );
+  const viaOpenAi = !legacyOnly && (await routeViaOpenAi(apiKey, cleanModel));
+  const stopSeq = (body as unknown as { stop_sequences?: string[] }).stop_sequences;
+  const nativeBody: OpenAiChatBody = {
+    model: cleanModel,
+    messages: toNativeOpenAiMessages(baseMessages),
+    ...(hasTools && tools ? { tools: toNativeTools(tools as unknown as ToolDefinition[]) } : {}),
+    ...(hasTools && toNativeToolChoice(tool_choice) !== undefined
+      ? { tool_choice: toNativeToolChoice(tool_choice) }
+      : {}),
+    ...(body.max_tokens ? { max_tokens: body.max_tokens } : {}),
+    ...(typeof mExtra.temperature === "number" ? { temperature: mExtra.temperature } : {}),
+    ...(typeof mExtra.top_p === "number" ? { top_p: mExtra.top_p } : {}),
+    ...(stopSeq?.length ? { stop: stopSeq } : {}),
+  };
+  const stopReasonOf = (finish: string | null | undefined, hasCalls: boolean) =>
+    hasCalls || finish === "tool_calls"
+      ? "tool_use"
+      : finish === "length"
+        ? "max_tokens"
+        : "end_turn";
+
+  if (viaOpenAi) {
+    try {
+      if (stream) {
+        const raw = await callOpenAiChatStream(apiKey, nativeBody);
+        const encoder = new TextEncoder();
+        return new Response(
+          new ReadableStream({
+            async start(controller) {
+              const approxIn = Math.ceil(JSON.stringify(nativeBody.messages).length / 4);
+              writeAnthropicSSE(controller, encoder, "message_start", {
+                type: "message_start",
+                message: {
+                  id: messageId,
+                  type: "message",
+                  role: "assistant",
+                  content: [],
+                  model: cleanModel,
+                  stop_reason: null,
+                  stop_sequence: null,
+                  usage: { input_tokens: approxIn, output_tokens: 0 },
+                },
+              });
+              writeAnthropicSSE(controller, encoder, "ping", { type: "ping" });
+
+              let nextIndex = 0;
+              let openIndex: number | null = null;
+              let openKind: "text" | "tool" | null = null;
+              const toolBlocks = new Map<number, number>(); // upstream index -> block index
+              let finish: string | null = null;
+              let usage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+              let sawTool = false;
+              const closeBlock = () => {
+                if (openIndex !== null) {
+                  writeAnthropicSSE(controller, encoder, "content_block_stop", {
+                    type: "content_block_stop",
+                    index: openIndex,
+                  });
+                  openIndex = null;
+                  openKind = null;
+                }
+              };
+              try {
+                for await (const chunk of iterateOpenAiSse(raw)) {
+                  if (chunk.usage) usage = chunk.usage;
+                  const choice = chunk.choices?.[0];
+                  if (!choice) continue;
+                  if (choice.finish_reason) finish = choice.finish_reason;
+                  const text = choice.delta?.content;
+                  if (typeof text === "string" && text) {
+                    if (openKind !== "text") {
+                      closeBlock();
+                      openIndex = nextIndex++;
+                      openKind = "text";
+                      writeAnthropicSSE(controller, encoder, "content_block_start", {
+                        type: "content_block_start",
+                        index: openIndex,
+                        content_block: { type: "text", text: "" },
+                      });
+                    }
+                    writeAnthropicSSE(controller, encoder, "content_block_delta", {
+                      type: "content_block_delta",
+                      index: openIndex,
+                      delta: { type: "text_delta", text },
+                    });
+                  }
+                  for (const tc of choice.delta?.tool_calls ?? []) {
+                    sawTool = true;
+                    let blockIdx = toolBlocks.get(tc.index);
+                    if (blockIdx === undefined) {
+                      closeBlock();
+                      blockIdx = nextIndex++;
+                      toolBlocks.set(tc.index, blockIdx);
+                      openIndex = blockIdx;
+                      openKind = "tool";
+                      const rawId = tc.id || `call_${randomUUID().slice(0, 12)}`;
+                      writeAnthropicSSE(controller, encoder, "content_block_start", {
+                        type: "content_block_start",
+                        index: blockIdx,
+                        content_block: {
+                          type: "tool_use",
+                          id: rawId.replace(/^call_/, "toolu_"),
+                          name: tc.function?.name ?? "",
+                          input: {},
+                        },
+                      });
+                    }
+                    if (tc.function?.arguments) {
+                      writeAnthropicSSE(controller, encoder, "content_block_delta", {
+                        type: "content_block_delta",
+                        index: blockIdx,
+                        delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+                      });
+                    }
+                  }
+                }
+                closeBlock();
+                recordUsageMetrics(cleanModel, usage);
+                writeAnthropicSSE(controller, encoder, "message_delta", {
+                  type: "message_delta",
+                  delta: { stop_reason: stopReasonOf(finish, sawTool), stop_sequence: null },
+                  usage: { output_tokens: usage?.completion_tokens ?? 0 },
+                });
+                writeAnthropicSSE(controller, encoder, "message_stop", { type: "message_stop" });
+                controller.close();
+              } catch (err) {
+                console.error("Anthropic native streaming error:", err);
+                controller.error(err);
+              }
+            },
+          }),
+          {
+            headers: {
+              "Content-Type": "text/event-stream",
+              "Cache-Control": "no-cache",
+              Connection: "keep-alive",
+              "anthropic-version": "2023-06-01",
+              "X-Bridge-Route": "openai",
+            },
+          },
+        );
+      }
+
+      const res = await callOpenAiChat(apiKey, nativeBody);
+      const msg = res.choices?.[0]?.message;
+      const calls = msg?.tool_calls ?? [];
+      const text = ResponseSanitizer.stripReasoning(msg?.content ?? "");
+      if (!(hasTools && forcesToolCall(tool_choice) && calls.length === 0)) {
+        const blocks: AnthropicContentBlock[] = [];
+        if (text) blocks.push({ type: "text", text });
+        for (const tc of calls) {
+          let input: Record<string, unknown> = {};
+          try {
+            input = JSON.parse(tc.function.arguments || "{}");
+          } catch {
+            input = { raw: tc.function.arguments };
+          }
+          blocks.push({
+            type: "tool_use",
+            id: (tc.id || `call_${randomUUID().slice(0, 12)}`).replace(/^call_/, "toolu_"),
+            name: tc.function.name,
+            input,
+          });
+        }
+        if (blocks.length === 0) blocks.push({ type: "text", text: "" });
+        const inTok = res.usage?.prompt_tokens ?? 0;
+        const outTok = res.usage?.completion_tokens ?? 0;
+        c.set("promptTokens", inTok);
+        c.set("completionTokens", outTok);
+        const response: AnthropicMessageResponse = {
+          id: messageId,
+          type: "message",
+          role: "assistant",
+          content: blocks,
+          model: cleanModel,
+          stop_reason: stopReasonOf(res.choices?.[0]?.finish_reason, calls.length > 0),
+          stop_sequence: null,
+          usage: { input_tokens: inTok, output_tokens: outTok },
+        };
+        return c.json(response, 200, {
+          "anthropic-version": "2023-06-01",
+          "X-Bridge-Route": "openai",
+        });
+      }
+    } catch (err) {
+      if (!shouldFallbackToLegacy(err)) throw err;
+      console.warn("Anthropic native call failed, using legacy ReAct:", (err as Error).message);
+    }
+  }
 
   try {
     if (stream) {
-      const streamBody = await chatTextStream(apiKey, openAiBody, payload, legacyOnly);
+      const streamBody = await callChatStream(apiKey, payload);
       const encoder = new TextEncoder();
       const inputTokens = calculateTokens(prompt);
 
@@ -565,7 +759,7 @@ app.post("/v1/messages", async (c) => {
     }
 
     // Non-streaming response
-    const rawContent = await chatText(apiKey, openAiBody, payload, legacyOnly);
+    const rawContent = await extractLegacyText(await callChat(apiKey, payload));
 
     const toolCalls = hasTools
       ? ToolCallingEmulator.parseResponseWithFallback(

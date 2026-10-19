@@ -10,22 +10,32 @@ import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { getModelData, isVisionModel } from "../model-registry.js";
 import {
-  callChat,
-  callChatStream,
   callOpenAiChat,
   callOpenAiChatStream,
-  chatText,
+  chatTextFull,
   chatTextStream,
-  extractLegacyText,
   iterateOpenAiSse,
+  recordUsageMetrics,
+  routeViaOpenAi,
   shouldFallbackToLegacy,
-  supportsNativeTools,
+  forcesToolCall,
   toNativeOpenAiMessages,
+  toNativeToolChoice,
+  toNativeTools,
   toPlainOpenAiMessages,
   uploadAsset,
   type OpenAiChatBody,
+  type OpenAiUsage,
 } from "../adapters/onemin.js";
-import { config } from "../config.js";
+import {
+  cacheGetOrCompute,
+  cacheGet,
+  cacheKey,
+  cacheSet,
+  resolveCacheMode,
+  type CachedChat,
+} from "../cache/response-cache.js";
+import { keyId } from "../upstream/core.js";
 import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
 import {
   ToolCallingEmulator,
@@ -278,6 +288,7 @@ function buildStreamingResponse(
     hasTools?: boolean;
     includeUsage?: boolean;
     promptTokens?: number;
+    onComplete?: (result: CachedChat) => void;
   },
 ): Response {
   const created = nowSec();
@@ -486,6 +497,21 @@ function buildStreamingResponse(
             encoder.encode(`data: ${JSON.stringify(finalChunk)}\n\n`),
           );
 
+          if (options?.onComplete) {
+            const promptTokens = options.promptTokens ?? 0;
+            const completionTokens = calculateTokens(fullContent);
+            options.onComplete({
+              content: hasToolCalls ? null : ResponseSanitizer.cleanOutput(fullContent),
+              toolCalls: hasToolCalls ? toolCalls : null,
+              finishReason: hasToolCalls ? "tool_calls" : "stop",
+              usage: {
+                prompt_tokens: promptTokens,
+                completion_tokens: completionTokens,
+                total_tokens: promptTokens + completionTokens,
+              },
+            });
+          }
+
           if (options?.includeUsage) {
             const promptTokens = options.promptTokens ?? 0;
             const completionTokens = calculateTokens(fullContent);
@@ -529,43 +555,6 @@ function buildStreamingResponse(
 // OpenAI-upstream helpers (native tool calling + passthrough streaming)
 // ---------------------------------------------------------------------------
 
-/** Normalise OpenAI/Anthropic-style tool defs to OpenAI `tools` entries. */
-function toNativeTools(tools: ToolDefinition[]): unknown[] {
-  return tools.map((t) => ({
-    type: "function",
-    function: {
-      name: t.function?.name || t.name || "unnamed_tool",
-      description: t.function?.description || t.description || "",
-      parameters: t.function?.parameters ||
-        t.parameters ||
-        t.input_schema || { type: "object", properties: {} },
-    },
-  }));
-}
-
-function toNativeToolChoice(choice: unknown): unknown {
-  if (choice === undefined) return undefined;
-  if (typeof choice === "string") return choice;
-  if (typeof choice === "object" && choice !== null) {
-    const c = choice as { type?: string; name?: string; function?: { name?: string } };
-    if (c.type === "any") return "required";
-    if (c.type === "auto") return "auto";
-    if (c.function?.name) return { type: "function", function: { name: c.function.name } };
-    if (c.type === "tool" && c.name) return { type: "function", function: { name: c.name } };
-  }
-  return undefined;
-}
-
-/** True when the caller insists on a tool call (retry via ReAct is allowed). */
-function forcesToolCall(choice: unknown): boolean {
-  if (choice === "required") return true;
-  if (typeof choice === "object" && choice !== null) {
-    const c = choice as { type?: string; function?: unknown };
-    return c.type === "any" || c.type === "tool" || Boolean(c.function);
-  }
-  return false;
-}
-
 function sampling(body: ChatCompletionRequest) {
   const maxTokens = body.max_tokens ?? body.max_completion_tokens;
   return {
@@ -578,148 +567,257 @@ function sampling(body: ChatCompletionRequest) {
   };
 }
 
+/** Strip <think>…</think> spans from a streamed delta (stateful across chunks). */
+function filterThink(state: { inThink: boolean }, text: string): string {
+  let out = "";
+  let rest = text;
+  while (rest) {
+    if (state.inThink) {
+      const i = rest.indexOf("</think>");
+      if (i < 0) return out;
+      state.inThink = false;
+      rest = rest.slice(i + 8);
+    } else {
+      const i = rest.indexOf("<think>");
+      if (i < 0) {
+        out += rest;
+        break;
+      }
+      out += rest.slice(0, i);
+      state.inThink = true;
+      rest = rest.slice(i + 7);
+    }
+  }
+  return out;
+}
+
+type ChunkChoice = ChatCompletionChunk["choices"][number];
+
+function sseChunk(
+  chatId: string,
+  created: number,
+  model: string,
+  delta: ChunkChoice["delta"],
+  finishReason: string | null,
+): Uint8Array {
+  const chunk: ChatCompletionChunk = {
+    id: chatId,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [{ index: 0, delta, finish_reason: finishReason }],
+  };
+  return new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
+function usageChunk(
+  chatId: string,
+  created: number,
+  model: string,
+  usage: NonNullable<CachedChat["usage"]>,
+): Uint8Array {
+  const chunk: ChatCompletionChunk = {
+    id: chatId,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [],
+    usage,
+  };
+  return new TextEncoder().encode(`data: ${JSON.stringify(chunk)}\n\n`);
+}
+
+/** Return a copy of a Response with extra headers (survives Hono middleware). */
+function withHeaders(r: Response, extra: Record<string, string>): Response {
+  const h = new Headers(r.headers);
+  for (const [k, v] of Object.entries(extra)) h.set(k, v);
+  return new Response(r.body, { status: r.status, headers: h });
+}
+
+const SSE_HEADERS = {
+  "Content-Type": "text/event-stream",
+  "Cache-Control": "no-cache",
+  Connection: "keep-alive",
+};
+
 /**
- * Stream a native tool-calling model: forward upstream chat.completion.chunk
- * deltas (id/model rewritten). If a tools request ends with prose that holds a
- * textual tool call, convert it into tool_call deltas.
+ * Stream from the OpenAI upstream: forward chat.completion.chunk deltas with
+ * id/model rewritten, strip <think> spans, accumulate the result for caching,
+ * and convert a textual tool call into tool_call deltas if the model emitted
+ * one as prose.
  */
 function buildNativeStreamingResponse(
   upstream: ReadableStream<Uint8Array>,
   model: string,
   chatId: string,
   options: {
-    allowedTools: ToolDefinition[];
+    allowedTools?: ToolDefinition[];
     includeUsage: boolean;
-    promptTokens: number;
+    fallbackPromptTokens: number;
+    onComplete?: (result: CachedChat) => void;
   },
 ): Response {
   const created = nowSec();
   const encoder = new TextEncoder();
-  const send = (
-    controller: ReadableStreamDefaultController<Uint8Array>,
-    chunk: ChatCompletionChunk,
-  ) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
 
   return new Response(
     new ReadableStream<Uint8Array>({
       async start(controller) {
         let fullContent = "";
-        let sawToolCalls = false;
+        const think = { inThink: false };
+        const acc = new Map<number, { id: string; name: string; args: string }>();
         let finishReason: string | null = null;
-        let upstreamUsage:
-          | { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
-          | undefined;
+        let usage: OpenAiUsage | undefined;
         try {
           for await (const chunk of iterateOpenAiSse(upstream)) {
-            if (chunk.usage) upstreamUsage = chunk.usage;
+            if (chunk.usage) usage = chunk.usage;
             const choice = chunk.choices?.[0];
             if (!choice) continue;
-            const delta = choice.delta ?? {};
-            if (typeof delta.content === "string") fullContent += delta.content;
-            if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
-              sawToolCalls = true;
+            const delta = { ...(choice.delta ?? {}) };
+            if (typeof delta.content === "string") {
+              const visible = filterThink(think, delta.content);
+              fullContent += visible;
+              if (visible) delta.content = visible;
+              else delete delta.content;
             }
-            if (choice.finish_reason) {
-              finishReason = choice.finish_reason;
-              if (!delta.content && !delta.tool_calls) continue; // hold final marker
+            if (Array.isArray(delta.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                if (tc.id === null) delete tc.id; // some providers send "id": null
+                const cur = acc.get(tc.index) ?? { id: "", name: "", args: "" };
+                if (tc.id) cur.id = tc.id;
+                if (tc.function?.name) cur.name += tc.function.name;
+                if (tc.function?.arguments) cur.args += tc.function.arguments;
+                acc.set(tc.index, cur);
+              }
             }
-            send(controller, {
-              id: chatId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [
-                {
-                  index: 0,
-                  delta: delta as ChatCompletionChunk["choices"][number]["delta"],
-                  finish_reason: null,
-                },
-              ],
-            });
+            if (choice.finish_reason) finishReason = choice.finish_reason;
+            if (Object.keys(delta).length === 0) continue;
+            controller.enqueue(
+              sseChunk(chatId, created, model, delta as ChunkChoice["delta"], null),
+            );
           }
 
-          if (!sawToolCalls && fullContent) {
+          let toolCalls: ToolCall[] | null =
+            acc.size > 0
+              ? [...acc.entries()]
+                  .sort((x, y) => x[0] - y[0])
+                  .map(([, v], i) => ({
+                    id: v.id || `call_${randomUUID().replace(/-/g, "").slice(0, 24)}_${i}`,
+                    type: "function" as const,
+                    function: { name: v.name, arguments: v.args || "{}" },
+                  }))
+              : null;
+
+          if (!toolCalls && fullContent && options.allowedTools?.length) {
             const parsed = ToolCallingEmulator.parseResponseWithFallback(
               fullContent,
               options.allowedTools,
               (t) => parseToolCalls(t),
             );
             if (parsed && parsed.length > 0) {
-              sawToolCalls = true;
+              toolCalls = parsed;
               for (const d of ToolCallingEmulator.formatProgressiveToolCallDeltas(parsed)) {
-                send(controller, {
-                  id: chatId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model,
-                  choices: [
+                controller.enqueue(
+                  sseChunk(
+                    chatId,
+                    created,
+                    model,
                     {
-                      index: 0,
-                      delta: {
-                        tool_calls: [
-                          {
-                            index: d.index,
-                            ...(d.id ? { id: d.id } : {}),
-                            type: "function",
-                            function: { ...d.function },
-                          },
-                        ],
-                      },
-                      finish_reason: null,
+                      tool_calls: [
+                        {
+                          index: d.index,
+                          ...(d.id ? { id: d.id } : {}),
+                          type: "function",
+                          function: { ...d.function },
+                        },
+                      ],
                     },
-                  ],
-                });
+                    null,
+                  ),
+                );
               }
             }
           }
 
-          send(controller, {
-            id: chatId,
-            object: "chat.completion.chunk",
-            created,
-            model,
-            choices: [
-              {
-                index: 0,
-                delta: {},
-                finish_reason: sawToolCalls ? "tool_calls" : (finishReason ?? "stop"),
-              },
-            ],
-          });
+          const finish = toolCalls ? "tool_calls" : (finishReason ?? "stop");
+          controller.enqueue(sseChunk(chatId, created, model, {}, finish));
 
+          const promptTokens = usage?.prompt_tokens ?? options.fallbackPromptTokens;
+          const completionTokens = usage?.completion_tokens ?? calculateTokens(fullContent);
+          const finalUsage = {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: promptTokens + completionTokens,
+          };
+          recordUsageMetrics(model, usage);
           if (options.includeUsage) {
-            const completionTokens =
-              upstreamUsage?.completion_tokens ?? calculateTokens(fullContent);
-            const promptTokens = upstreamUsage?.prompt_tokens ?? options.promptTokens;
-            send(controller, {
-              id: chatId,
-              object: "chat.completion.chunk",
-              created,
-              model,
-              choices: [],
-              usage: {
-                prompt_tokens: promptTokens,
-                completion_tokens: completionTokens,
-                total_tokens: promptTokens + completionTokens,
-              },
-            });
+            controller.enqueue(usageChunk(chatId, created, model, finalUsage));
           }
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
+          options.onComplete?.({
+            content: toolCalls ? null : fullContent,
+            toolCalls,
+            finishReason: finish,
+            usage: finalUsage,
+          });
         } catch (err) {
           console.error("Native stream error:", err);
           controller.error(err);
         }
       },
     }),
-    {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "X-Request-Id": chatId,
+    { headers: { ...SSE_HEADERS, "X-Request-Id": chatId } },
+  );
+}
+
+/** Replay a cached result as an SSE stream. */
+function replayCachedStream(
+  result: CachedChat,
+  model: string,
+  chatId: string,
+  includeUsage: boolean,
+): Response {
+  const created = nowSec();
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(sseChunk(chatId, created, model, { role: "assistant" }, null));
+        if (result.content) {
+          controller.enqueue(sseChunk(chatId, created, model, { content: result.content }, null));
+        }
+        if (result.toolCalls) {
+          for (const d of ToolCallingEmulator.formatProgressiveToolCallDeltas(result.toolCalls)) {
+            controller.enqueue(
+              sseChunk(
+                chatId,
+                created,
+                model,
+                {
+                  tool_calls: [
+                    {
+                      index: d.index,
+                      ...(d.id ? { id: d.id } : {}),
+                      type: "function",
+                      function: { ...d.function },
+                    },
+                  ],
+                },
+                null,
+              ),
+            );
+          }
+        }
+        controller.enqueue(sseChunk(chatId, created, model, {}, result.finishReason));
+        if (includeUsage && result.usage) {
+          controller.enqueue(usageChunk(chatId, created, model, result.usage));
+        }
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
       },
-    },
+    }),
+    { headers: { ...SSE_HEADERS, "X-Request-Id": chatId } },
   );
 }
 
@@ -773,21 +871,6 @@ app.post("/v1/chat/completions", async (c) => {
     imageList = await extractImageUrls(apiKey, messages);
   }
 
-  // Tool calling: inject instructions into messages
-  const hasTools = Array.isArray(tools) && tools.length > 0 && tool_choice !== "none";
-  let finalMessages = messages;
-  if (hasTools && tools) {
-    finalMessages = ToolCallingEmulator.injectToolsIntoMessages(
-      messages,
-      tools as ToolDefinition[],
-      tool_choice,
-    );
-  }
-
-  const prompt = formatMessagesFor1Min(finalMessages);
-  c.set("model", cleanModel);
-  c.set("promptTokens", calculateTokens(prompt));
-
   const extra = body as unknown as Record<string, unknown>;
   const numOfSite =
     typeof extra.numOfSite === "number" ? extra.numOfSite : undefined;
@@ -804,163 +887,113 @@ app.post("/v1/chat/completions", async (c) => {
   const conversationId =
     typeof extra.conversationId === "string" ? extra.conversationId : undefined;
 
-  const payload: OneMinRequestBody = {
-    type: resolvedFeatureType,
-    model: cleanModel,
-    ...(brandVoiceId ? { brandVoiceId } : {}),
-    promptObject: {
-      prompt,
-      ...(conversationId ? { conversationId } : {}),
-      settings: {
-        webSearchSettings: {
-          webSearch,
-          ...(numOfSite !== undefined ? { numOfSite } : {}),
-          ...(maxWord !== undefined ? { maxWord } : {}),
-        },
-        historySettings: {
-          isMixed: false,
-          ...(historyMessageLimit !== undefined ? { historyMessageLimit } : {}),
-        },
-        ...(withMemories !== undefined ? { withMemories } : {}),
-      },
-      ...(imageList.length > 0 ? { attachments: { images: imageList } } : {}),
-      ...(body.max_tokens || body.max_completion_tokens
-        ? { maxTokens: body.max_tokens ?? body.max_completion_tokens }
-        : {}),
-    },
-  };
-
-  const chatId = newChatId();
-
-  // Route selection. The OpenAI-compatible upstream is primary; features that
-  // only exist on the legacy endpoint (web search, vision attachments,
-  // brand voice, memories, conversation ids) stay on /api/chat-with-ai.
+  // Route selection. The OpenAI-compatible upstream is primary (native tools on
+  // every model it serves). Features that only exist on the legacy endpoint
+  // (web search, vision attachments, brand voice, memories, conversation ids)
+  // and models the endpoint does not serve use /api/chat-with-ai.
   const legacyOnly =
     webSearch ||
     isVision ||
     [brandVoiceId, conversationId, numOfSite, maxWord, historyMessageLimit, withMemories].some(
       (v) => v !== undefined,
     );
-  const useOpenAi = config.oneMinOpenAiEnabled && !legacyOnly;
-  const nativeMode = useOpenAi && hasTools && supportsNativeTools(cleanModel);
+  const viaOpenAi = !legacyOnly && (await routeViaOpenAi(apiKey, cleanModel));
+  c.set("model", cleanModel);
+  c.header("X-Bridge-Route", viaOpenAi ? "openai" : "legacy");
+
+  const hasTools = Array.isArray(tools) && tools.length > 0 && tool_choice !== "none";
   const sampled = sampling(body);
-  const emulatedBody: OpenAiChatBody = {
-    model: cleanModel,
-    messages: toPlainOpenAiMessages(finalMessages),
-    ...sampled,
+  const structured =
+    body.response_format?.type === "json_schema"
+      ? { response_format: body.response_format as Record<string, unknown> }
+      : {};
+
+  // Legacy / ReAct material is built lazily: the native path never pays for it.
+  let legacyCache: { prompt: string; payload: OneMinRequestBody; emulated: OpenAiChatBody } | null = null;
+  const legacy = () => {
+    if (legacyCache) return legacyCache;
+    const finalMessages = hasTools
+      ? ToolCallingEmulator.injectToolsIntoMessages(messages, tools as ToolDefinition[], tool_choice)
+      : messages;
+    const prompt = formatMessagesFor1Min(finalMessages);
+    const payload: OneMinRequestBody = {
+      type: resolvedFeatureType,
+      model: cleanModel,
+      ...(brandVoiceId ? { brandVoiceId } : {}),
+      promptObject: {
+        prompt,
+        ...(conversationId ? { conversationId } : {}),
+        settings: {
+          webSearchSettings: {
+            webSearch,
+            ...(numOfSite !== undefined ? { numOfSite } : {}),
+            ...(maxWord !== undefined ? { maxWord } : {}),
+          },
+          historySettings: {
+            isMixed: false,
+            ...(historyMessageLimit !== undefined ? { historyMessageLimit } : {}),
+          },
+          ...(withMemories !== undefined ? { withMemories } : {}),
+        },
+        ...(imageList.length > 0 ? { attachments: { images: imageList } } : {}),
+        ...(body.max_tokens || body.max_completion_tokens
+          ? { maxTokens: body.max_tokens ?? body.max_completion_tokens }
+          : {}),
+      },
+    };
+    legacyCache = {
+      prompt,
+      payload,
+      emulated: { model: cleanModel, messages: toPlainOpenAiMessages(finalMessages), ...sampled },
+    };
+    return legacyCache;
   };
+
+  // json_object is rejected upstream: enforce it with a stable leading system
+  // instruction (keeps the cacheable prefix constant) and strip fences below.
+  const jsonMode = body.response_format?.type === "json_object";
+  const nativeMessages = toNativeOpenAiMessages(messages);
+  if (jsonMode) {
+    nativeMessages.unshift({
+      role: "system",
+      content:
+        "Respond with a single valid JSON object only. No prose, no markdown code fences.",
+    });
+  }
   const nativeBody: OpenAiChatBody = {
     model: cleanModel,
-    messages: toNativeOpenAiMessages(messages),
+    messages: nativeMessages,
     ...(tools && hasTools ? { tools: toNativeTools(tools as ToolDefinition[]) } : {}),
-    ...(toNativeToolChoice(tool_choice) !== undefined
+    ...(hasTools && toNativeToolChoice(tool_choice) !== undefined
       ? { tool_choice: toNativeToolChoice(tool_choice) }
       : {}),
     ...sampled,
+    ...structured,
   };
 
-  try {
-    if (stream) {
-      const streamingOptions = {
-        allowedTools: tools as ToolDefinition[] | undefined,
-        hasTools,
-        includeUsage: body.stream_options?.include_usage ?? false,
-        promptTokens: calculateTokens(prompt),
-      };
+  const chatId = newChatId();
+  const includeUsage = body.stream_options?.include_usage ?? false;
 
-      if (nativeMode) {
-        try {
-          const raw = await callOpenAiChatStream(apiKey, nativeBody);
-          return buildNativeStreamingResponse(raw, cleanModel, chatId, {
-            allowedTools: tools as ToolDefinition[],
-            includeUsage: streamingOptions.includeUsage,
-            promptTokens: streamingOptions.promptTokens,
-          });
-        } catch (err) {
-          if (!shouldFallbackToLegacy(err)) throw err;
-          console.warn("Native tool stream failed, using ReAct emulation:", (err as Error).message);
-        }
-      }
+  // Response cache (deterministic requests only; see resolveCacheMode)
+  const cacheable = !legacyOnly && resolveCacheMode(c.req.raw.headers, body.temperature);
+  const key = cacheable
+    ? cacheKey({
+        k: keyId(apiKey),
+        model: cleanModel,
+        messages,
+        tools: hasTools ? tools : null,
+        tool_choice: hasTools ? tool_choice : null,
+        sampled,
+        structured,
+      })
+    : null;
 
-      const streamBody = useOpenAi
-        ? await chatTextStream(apiKey, emulatedBody, payload)
-        : await callChatStream(apiKey, payload);
-      const syntheticResponse = new Response(streamBody, {
-        headers: { "Content-Type": "text/event-stream" },
-      });
-      return buildStreamingResponse(
-        syntheticResponse,
-        cleanModel,
-        chatId,
-        streamingOptions,
-      );
-    }
-
-    // Non-streaming
-    let rawContent = "";
-    let nativeToolCalls: ToolCall[] | null = null;
-    let nativeHandled = false;
-
-    if (nativeMode) {
-      try {
-        const res = await callOpenAiChat(apiKey, nativeBody);
-        const msg = res.choices?.[0]?.message;
-        if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) {
-          nativeToolCalls = msg.tool_calls.map((tc, i) => ({
-            id: tc.id || `call_${randomUUID().replace(/-/g, "").slice(0, 24)}_${i}`,
-            type: "function" as const,
-            function: {
-              name: tc.function.name,
-              arguments:
-                typeof tc.function.arguments === "string"
-                  ? tc.function.arguments
-                  : JSON.stringify(tc.function.arguments ?? {}),
-            },
-          }));
-          nativeHandled = true;
-        } else if (typeof msg?.content === "string") {
-          rawContent = msg.content;
-          nativeHandled = true;
-          // Prose that holds a textual tool call is still honoured below; a
-          // forced tool_choice that yielded prose is retried through ReAct.
-          const textual = ToolCallingEmulator.parseResponseWithFallback(
-            rawContent,
-            tools as ToolDefinition[],
-            (t) => parseToolCalls(t),
-          );
-          if (!textual && forcesToolCall(tool_choice)) nativeHandled = false;
-        }
-      } catch (err) {
-        if (!shouldFallbackToLegacy(err)) throw err;
-        console.warn("Native tool call failed, using ReAct emulation:", (err as Error).message);
-      }
-    }
-
-    if (!nativeHandled) {
-      rawContent = useOpenAi
-        ? await chatText(apiKey, emulatedBody, payload)
-        : extractLegacyText(await callChat(apiKey, payload));
-    }
-
-    // Parse tool calls (primary + Mistral/Qwen/XML fallback)
-    const toolCalls =
-      nativeToolCalls ??
-      ToolCallingEmulator.parseResponseWithFallback(
-        rawContent,
-        tools as ToolDefinition[],
-        (t) => parseToolCalls(t),
-      );
-
-    const finishReason =
-      toolCalls && toolCalls.length > 0 ? "tool_calls" : "stop";
-
-    const cleanContent = toolCalls
-      ? null
-      : ResponseSanitizer.cleanOutput(rawContent);
-
-    const promptTokens = calculateTokens(prompt);
-    const completionTokens = calculateTokens(rawContent);
-
+  const finish = (result: CachedChat, status: string): Response => {
+    const promptTokens = result.usage?.prompt_tokens ?? 0;
+    const completionTokens = result.usage?.completion_tokens ?? 0;
+    c.set("promptTokens", promptTokens);
+    c.set("completionTokens", completionTokens);
+    if (status === "HIT" || status === "COALESCED") c.set("credits", 0);
     const response: ChatCompletionResponse = {
       id: chatId,
       object: "chat.completion",
@@ -971,22 +1004,187 @@ app.post("/v1/chat/completions", async (c) => {
           index: 0,
           message: {
             role: "assistant",
-            content: cleanContent,
-            ...(toolCalls && toolCalls.length > 0
-              ? { tool_calls: toolCalls }
+            content: result.content,
+            ...(result.toolCalls && result.toolCalls.length > 0
+              ? { tool_calls: result.toolCalls }
               : {}),
           },
-          finish_reason: finishReason,
+          finish_reason: result.finishReason,
         },
       ],
       usage: {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
-        total_tokens: promptTokens + completionTokens,
+        total_tokens: result.usage?.total_tokens ?? promptTokens + completionTokens,
       },
     };
+    return c.json(response, 200, key ? { "X-Bridge-Cache": status } : {});
+  };
 
-    return c.json(response);
+  try {
+    if (stream) {
+      if (key) {
+        const hit = cacheGet(key);
+        if (hit) {
+          c.set("promptTokens", 0);
+          c.set("completionTokens", 0);
+          c.set("credits", 0);
+          return withHeaders(replayCachedStream(hit, cleanModel, chatId, includeUsage), {
+            "X-Bridge-Cache": "HIT",
+            "X-Bridge-Route": "cache",
+          });
+        }
+      }
+      const onComplete = key ? (r: CachedChat) => cacheSet(key, r) : undefined;
+      const approxPrompt = Math.ceil(JSON.stringify(messages).length / 4);
+      c.set("promptTokens", approxPrompt);
+
+      let nativeFailed = false;
+      if (viaOpenAi) {
+        try {
+          const raw = await callOpenAiChatStream(apiKey, nativeBody);
+          const r = buildNativeStreamingResponse(raw, cleanModel, chatId, {
+            allowedTools: hasTools ? (tools as ToolDefinition[]) : undefined,
+            includeUsage,
+            fallbackPromptTokens: approxPrompt,
+            onComplete,
+          });
+          return withHeaders(r, {
+            "X-Bridge-Route": "openai",
+            ...(key ? { "X-Bridge-Cache": "MISS" } : {}),
+          });
+        } catch (err) {
+          if (!shouldFallbackToLegacy(err)) throw err;
+          nativeFailed = true;
+          console.warn("Native stream failed, falling back:", (err as Error).message);
+        }
+      }
+
+      const lg = legacy();
+      c.set("promptTokens", calculateTokens(lg.prompt));
+      const streamBody = await chatTextStream(
+        apiKey,
+        lg.emulated,
+        lg.payload,
+        !viaOpenAi || nativeFailed,
+      );
+      const r = buildStreamingResponse(
+        new Response(streamBody, { headers: { "Content-Type": "text/event-stream" } }),
+        cleanModel,
+        chatId,
+        {
+          allowedTools: tools as ToolDefinition[] | undefined,
+          hasTools,
+          includeUsage,
+          promptTokens: calculateTokens(lg.prompt),
+          onComplete,
+        },
+      );
+      return withHeaders(r, {
+        "X-Bridge-Route": "legacy",
+        ...(key ? { "X-Bridge-Cache": "MISS" } : {}),
+      });
+    }
+
+    // Non-streaming
+    const generate = async (): Promise<CachedChat> => {
+      let nativeFailed = false;
+      if (viaOpenAi) {
+        try {
+          const res = await callOpenAiChat(apiKey, nativeBody);
+          const choice = res.choices?.[0];
+          const msg = choice?.message;
+          const usage = res.usage
+            ? {
+                prompt_tokens: res.usage.prompt_tokens ?? 0,
+                completion_tokens: res.usage.completion_tokens ?? 0,
+                total_tokens:
+                  res.usage.total_tokens ??
+                  (res.usage.prompt_tokens ?? 0) + (res.usage.completion_tokens ?? 0),
+              }
+            : undefined;
+          if (Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0) {
+            return {
+              content: null,
+              toolCalls: msg.tool_calls.map((tc, i) => ({
+                id: tc.id || `call_${randomUUID().replace(/-/g, "").slice(0, 24)}_${i}`,
+                type: "function" as const,
+                function: {
+                  name: tc.function.name,
+                  arguments:
+                    typeof tc.function.arguments === "string"
+                      ? tc.function.arguments
+                      : JSON.stringify(tc.function.arguments ?? {}),
+                },
+              })),
+              finishReason: "tool_calls",
+              usage,
+            };
+          }
+          if (typeof msg?.content === "string") {
+            const text = msg.content;
+            // Prose that holds a textual tool call is still honoured.
+            const textual = hasTools
+              ? ToolCallingEmulator.parseResponseWithFallback(
+                  text,
+                  tools as ToolDefinition[],
+                  (t) => parseToolCalls(t),
+                )
+              : null;
+            if (textual && textual.length > 0) {
+              return { content: null, toolCalls: textual, finishReason: "tool_calls", usage };
+            }
+            // A forced tool_choice that produced prose is retried via ReAct.
+            if (!(hasTools && forcesToolCall(tool_choice))) {
+              const visible = ResponseSanitizer.stripReasoning(text);
+              const fenced = jsonMode ? /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(visible.trim()) : null;
+              return {
+                content: fenced ? fenced[1]! : visible,
+                toolCalls: null,
+                finishReason: choice?.finish_reason ?? "stop",
+                usage,
+              };
+            }
+          }
+        } catch (err) {
+          if (!shouldFallbackToLegacy(err)) throw err;
+          nativeFailed = true;
+          console.warn("Native call failed, falling back:", (err as Error).message);
+        }
+      }
+
+      const lg = legacy();
+      const { text, usage: u } = await chatTextFull(
+        apiKey,
+        lg.emulated,
+        lg.payload,
+        !viaOpenAi || nativeFailed,
+      );
+      const toolCalls = ToolCallingEmulator.parseResponseWithFallback(
+        text,
+        tools as ToolDefinition[],
+        (t) => parseToolCalls(t),
+      );
+      const hasCalls = Boolean(toolCalls && toolCalls.length > 0);
+      const promptTokens = u?.prompt_tokens ?? calculateTokens(lg.prompt);
+      const completionTokens = u?.completion_tokens ?? calculateTokens(text);
+      return {
+        content: hasCalls ? null : ResponseSanitizer.cleanOutput(text),
+        toolCalls: hasCalls ? toolCalls : null,
+        finishReason: hasCalls ? "tool_calls" : "stop",
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+        },
+      };
+    };
+
+    if (key) {
+      const { value, status } = await cacheGetOrCompute(key, generate);
+      return finish(value, status);
+    }
+    return finish(await generate(), "BYPASS");
   } catch (err) {
     console.error("Chat completion error:", err);
     throw err;

@@ -25,6 +25,13 @@ const envSchema = z.object({
     .url()
     .default("https://api.1min.ai/openai/v1/chat/completions"),
   ONE_MIN_OPENAI_ENABLED: z.string().default("true"),
+  ONE_MIN_UPSTREAM_RPM: z.string().default("55"),
+  ONE_MIN_UPSTREAM_MAX_WAIT_MS: z.string().default("20000"),
+  ONE_MIN_UPSTREAM_RETRIES: z.string().default("2"),
+  ONE_MIN_STREAM_IDLE_MS: z.string().default("60000"),
+  RESPONSE_CACHE_ENABLED: z.string().default("true"),
+  RESPONSE_CACHE_TTL_S: z.string().default("600"),
+  RESPONSE_CACHE_MAX_ENTRIES: z.string().default("500"),
   ONE_MIN_MODELS_URL: z.string().url().default("https://api.1min.ai/models"),
   ONE_MIN_ASSET_URL: z.string().url().default("https://api.1min.ai/api/assets"),
   CACHE_TTL_MS: z.string().default("1800000"),
@@ -71,6 +78,17 @@ function loadConfig(): AppConfig {
     oneMinOpenAiEnabled:
       env.ONE_MIN_OPENAI_ENABLED.toLowerCase() !== "false" &&
       env.ONE_MIN_OPENAI_ENABLED !== "0",
+    upstreamRpm: parseInt(env.ONE_MIN_UPSTREAM_RPM, 10) || 55,
+    upstreamMaxWaitMs: parseInt(env.ONE_MIN_UPSTREAM_MAX_WAIT_MS, 10) || 20000,
+    upstreamRetries: Math.max(0, parseInt(env.ONE_MIN_UPSTREAM_RETRIES, 10) || 0),
+    streamIdleMs: parseInt(env.ONE_MIN_STREAM_IDLE_MS, 10) || 60000,
+    responseCache: {
+      enabled:
+        env.RESPONSE_CACHE_ENABLED.toLowerCase() !== "false" &&
+        env.RESPONSE_CACHE_ENABLED !== "0",
+      ttlMs: (parseInt(env.RESPONSE_CACHE_TTL_S, 10) || 600) * 1000,
+      maxEntries: parseInt(env.RESPONSE_CACHE_MAX_ENTRIES, 10) || 500,
+    },
     oneMinModelsUrl: env.ONE_MIN_MODELS_URL,
     oneMinAssetUrl: env.ONE_MIN_ASSET_URL,
     cacheTtlMs: parseInt(env.CACHE_TTL_MS, 10),

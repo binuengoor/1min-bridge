@@ -427,6 +427,11 @@ export interface AppConfig {
   oneMinChatStreamingUrl: string;
   oneMinOpenAiChatUrl: string;
   oneMinOpenAiEnabled: boolean;
+  upstreamRpm: number;
+  upstreamMaxWaitMs: number;
+  upstreamRetries: number;
+  streamIdleMs: number;
+  responseCache: { enabled: boolean; ttlMs: number; maxEntries: number };
   oneMinModelsUrl: string;
   oneMinAssetUrl: string;
   cacheTtlMs: number;
