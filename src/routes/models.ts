@@ -4,6 +4,8 @@
 
 import { Hono } from "hono";
 import { getModelData } from "../model-registry.js";
+import { groupNames } from "../model-groups.js";
+import { peekEndpointModels } from "../upstream/core.js";
 import { modelNotFoundError, sendError } from "../errors.js";
 import type { Env, OpenAIModel, OneMinModelEntry } from "../types.js";
 
@@ -12,6 +14,12 @@ const app = new Hono<Env>();
 /** Map 1min.ai features to OpenRouter supported_parameters */
 function supportedParams(entry: OneMinModelEntry): string[] {
   const params = ["max_tokens", "temperature", "top_p", "stop", "stream", "response_format"];
+
+  // Every model served by the OpenAI endpoint executes native tool calls.
+  if (peekEndpointModels()?.has(entry.modelId)) {
+    params.push("tools", "tool_choice");
+    return params;
+  }
 
   // Infer tool support from model name patterns
   const id = entry.modelId.toLowerCase();
@@ -85,9 +93,17 @@ app.get("/v1/models", async (c) => {
   const data = await getModelData();
   const models: OpenAIModel[] = data.entries.map((entry) => enrichModel(entry, data.fetchedAt));
 
+  const groups: OpenAIModel[] = groupNames().map((name) => ({
+    id: name,
+    object: "model" as const,
+    name: `${name} (model group, automatic fallback)`,
+    created: Math.floor(data.fetchedAt / 1000),
+    owned_by: "1min-bridge",
+  }));
+
   return c.json({
     object: "list" as const,
-    data: models,
+    data: [...groups, ...models],
   });
 });
 

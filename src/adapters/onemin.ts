@@ -20,6 +20,7 @@ import {
   recordUpstreamSuccess,
   recordUpstreamFailure,
   markModelUnsupported,
+  requestContext,
 } from "../upstream/core.js";
 import { incrementCounter } from "../metrics.js";
 import type { ToolDefinition } from "./tool-emulator.js";
@@ -59,6 +60,7 @@ export interface OpenAiChatBody {
   presence_penalty?: number;
   stop?: string | string[];
   response_format?: Record<string, unknown>;
+  reasoning_effort?: string;
   tools?: unknown[];
   tool_choice?: unknown;
 }
@@ -421,6 +423,8 @@ export function openAiStreamToTextStream(
 /** Whether a failed OpenAI-upstream call should retry on the legacy endpoint. */
 export function shouldFallbackToLegacy(err: unknown): boolean {
   if (!config.oneMinOpenAiEnabled) return false;
+  // Inside a model group, prefer the next member over the costlier legacy API.
+  if (requestContext.getStore()?.noLegacyFallback) return false;
   if (err instanceof RelayError) {
     return ![401, 403, 429].includes(err.status);
   }

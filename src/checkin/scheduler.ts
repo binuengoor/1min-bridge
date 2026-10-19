@@ -4,7 +4,7 @@
 
 import { config } from "../config.js";
 import { OneMinCheckinClient } from "./client.js";
-import { dispatchCheckinNotification } from "./notifier.js";
+import { dispatchCheckinNotification, dispatchTextAlert } from "./notifier.js";
 import { getCheapestChatModels } from "../model-registry.js";
 import { getEndpointModels } from "../upstream/core.js";
 import type {
@@ -122,6 +122,7 @@ export class CheckinScheduler {
 
       // Dispatch Telegram / Webhook notification
       await dispatchCheckinNotification(this.config, result);
+      await this.maybeAlertLowCredits(result);
 
       // Trigger periodic 30-day lifetime credit keep-alive ping if due
       if (this.config.keepAliveEnabled) {
@@ -299,6 +300,21 @@ export class CheckinScheduler {
     };
     this.lastKeepAliveResult = res;
     return res;
+  }
+
+  private lastLowCreditAlert = 0;
+
+  /** Alert (at most once per 24h) when remaining credits fall below the threshold. */
+  private async maybeAlertLowCredits(result: CheckinResult): Promise<void> {
+    const threshold = this.config.lowCreditPercent ?? 10;
+    const pct = Number(result.availablePercent);
+    if (!result.success || !Number.isFinite(pct) || threshold <= 0 || pct >= threshold) return;
+    if (Date.now() - this.lastLowCreditAlert < 24 * 60 * 60 * 1000) return;
+    this.lastLowCreditAlert = Date.now();
+    await dispatchTextAlert(
+      this.config,
+      `⚠️ 1min.ai credits low: ${pct}% available (${result.finalCredit?.toLocaleString() ?? "?"} credits). Threshold ${threshold}%.`,
+    );
   }
 
   /**

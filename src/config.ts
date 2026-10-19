@@ -26,6 +26,7 @@ const envSchema = z.object({
     .default("https://api.1min.ai/openai/v1/chat/completions"),
   ONE_MIN_OPENAI_ENABLED: z.string().default("true"),
   ONE_MIN_UPSTREAM_RPM: z.string().default("55"),
+  ONE_MIN_UPSTREAM_WINDOW_MS: z.string().default("60000"),
   ONE_MIN_UPSTREAM_MAX_WAIT_MS: z.string().default("20000"),
   ONE_MIN_UPSTREAM_RETRIES: z.string().default("2"),
   ONE_MIN_STREAM_IDLE_MS: z.string().default("60000"),
@@ -53,6 +54,7 @@ const envSchema = z.object({
   CHECKIN_SETTLE_MS: z.string().default("3000"),
   CHECKIN_KEEP_ALIVE_ENABLED: z.string().default("true"),
   CHECKIN_KEEP_ALIVE_DAYS: z.string().default("7"),
+  CREDIT_ALERT_PERCENT: z.string().default("10"),
   CHECKIN_KEEP_ALIVE_MODEL: z.string().default("qwen3.7-flash"),
 });
 
@@ -79,6 +81,7 @@ function loadConfig(): AppConfig {
       env.ONE_MIN_OPENAI_ENABLED.toLowerCase() !== "false" &&
       env.ONE_MIN_OPENAI_ENABLED !== "0",
     upstreamRpm: parseInt(env.ONE_MIN_UPSTREAM_RPM, 10) || 55,
+    upstreamWindowMs: parseInt(env.ONE_MIN_UPSTREAM_WINDOW_MS, 10) || 60000,
     upstreamMaxWaitMs: parseInt(env.ONE_MIN_UPSTREAM_MAX_WAIT_MS, 10) || 20000,
     upstreamRetries: Math.max(0, parseInt(env.ONE_MIN_UPSTREAM_RETRIES, 10) || 0),
     streamIdleMs: parseInt(env.ONE_MIN_STREAM_IDLE_MS, 10) || 60000,
@@ -112,6 +115,7 @@ function loadConfig(): AppConfig {
       keepAliveEnabled: env.CHECKIN_KEEP_ALIVE_ENABLED.toLowerCase() !== "false" && env.CHECKIN_KEEP_ALIVE_ENABLED !== "0",
       keepAliveDays: parseInt(env.CHECKIN_KEEP_ALIVE_DAYS, 10) || 7,
       keepAliveModel: env.CHECKIN_KEEP_ALIVE_MODEL || "qwen3.7-flash",
+      lowCreditPercent: Number.isFinite(parseFloat(env.CREDIT_ALERT_PERCENT)) ? parseFloat(env.CREDIT_ALERT_PERCENT) : 10,
     },
   };
 }

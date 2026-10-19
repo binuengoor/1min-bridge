@@ -2,7 +2,7 @@
 // 1min-bridge — POST /v1/messages (Anthropic Messages API Compatibility)
 // ============================================================================
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { getModelData } from "../model-registry.js";
@@ -30,6 +30,8 @@ import {
 import { parseToolCalls } from "../adapters/tool-parser.js";
 import { ResponseSanitizer } from "../adapters/sanitizer.js";
 import { calculateTokens } from "../utils/tokens.js";
+import { runWithModelGroups } from "../model-groups.js";
+import { calculateCredits } from "../utils/credits.js";
 import type {
   Env,
   AnthropicMessageRequest,
@@ -256,11 +258,20 @@ function writeAnthropicSSE(
 // ---------------------------------------------------------------------------
 
 app.post("/v1/messages", async (c) => {
+  let raw: unknown;
+  try {
+    raw = await c.req.json();
+  } catch {
+    return sendError(c, invalidRequestError("Invalid JSON body"));
+  }
+  return runWithModelGroups(c, raw, handleMessages);
+});
+
+async function handleMessages(c: Context<Env>, raw: unknown): Promise<Response> {
   const apiKey = c.get("oneMinApiKey");
 
   let body: AnthropicMessageRequest;
   try {
-    const raw = await c.req.json();
     body = anthropicRequestSchema.parse(raw) as unknown as AnthropicMessageRequest;
   } catch (err) {
     if (err instanceof z.ZodError) {
@@ -521,6 +532,9 @@ app.post("/v1/messages", async (c) => {
         const outTok = res.usage?.completion_tokens ?? 0;
         c.set("promptTokens", inTok);
         c.set("completionTokens", outTok);
+        const est = await calculateCredits(cleanModel, inTok, outTok);
+        c.set("credits", est);
+        c.header("X-Bridge-Credits", String(est));
         const response: AnthropicMessageResponse = {
           id: messageId,
           type: "message",
@@ -820,6 +834,6 @@ app.post("/v1/messages", async (c) => {
     console.error("Anthropic message error:", err);
     throw err;
   }
-});
+}
 
 export default app;

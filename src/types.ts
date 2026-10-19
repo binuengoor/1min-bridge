@@ -428,6 +428,7 @@ export interface AppConfig {
   oneMinOpenAiChatUrl: string;
   oneMinOpenAiEnabled: boolean;
   upstreamRpm: number;
+  upstreamWindowMs: number;
   upstreamMaxWaitMs: number;
   upstreamRetries: number;
   streamIdleMs: number;
@@ -481,6 +482,7 @@ export interface CheckinConfig {
   keepAliveEnabled?: boolean; // Maintain 30-day lifetime bonus eligibility
   keepAliveDays?: number; // Days between credit keep-alive pings (default 7)
   keepAliveModel?: string; // Model to ping (default "qwen3.7-flash")
+  lowCreditPercent?: number; // Alert when available credits fall below this % (0 = off)
 }
 
 export interface CheckinResult {
@@ -540,6 +542,7 @@ export type Env = {
   };
   Variables: {
     oneMinApiKey: string;
+    savedCredits?: number;
     gatewayToken?: string;
     model?: string;
     promptTokens?: number;

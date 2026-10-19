@@ -18,6 +18,7 @@ export interface RequestRecord {
   promptTokens?: number;
   completionTokens?: number;
   credits: number;
+  savedCredits?: number;
 }
 
 export interface ModelStat {
@@ -44,6 +45,8 @@ export interface StatsSummary {
   serverTime: string;
   totalRequests: number;
   totalCreditsConsumed: number;
+  totalCreditsSaved: number;
+  cacheHits: number;
   models: ModelStat[];
   endpoints: EndpointStat[];
   recentRequests: RequestRecord[];
@@ -54,6 +57,8 @@ class StatsTracker {
   private startTime = Date.now();
   private totalRequests = 0;
   private totalCreditsConsumed = 0;
+  private totalCreditsSaved = 0;
+  private cacheHits = 0;
   private modelStats: Map<string, { requests: number; credits: number; promptTokens: number; completionTokens: number; lastUsed: string }> = new Map();
   private endpointStats: Map<string, { method: string; path: string; requests: number; credits: number; successCount: number; errorCount: number; totalDurationMs: number }> = new Map();
   private recentRequests: RequestRecord[] = [];
@@ -67,9 +72,14 @@ class StatsTracker {
     promptTokens?: number;
     completionTokens?: number;
     credits?: number;
+    savedCredits?: number;
     requestId?: string;
   }): void {
     const credits = data.credits ?? 0;
+    if (data.savedCredits && data.savedCredits > 0) {
+      this.totalCreditsSaved += data.savedCredits;
+      this.cacheHits++;
+    }
     this.totalRequests++;
     this.totalCreditsConsumed += credits;
 
@@ -165,6 +175,8 @@ class StatsTracker {
       serverTime: new Date().toISOString(),
       totalRequests: this.totalRequests,
       totalCreditsConsumed: Math.round(this.totalCreditsConsumed * 10) / 10,
+      totalCreditsSaved: Math.round(this.totalCreditsSaved * 10) / 10,
+      cacheHits: this.cacheHits,
       models,
       endpoints,
       recentRequests: this.recentRequests,

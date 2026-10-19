@@ -261,6 +261,10 @@ http://localhost:3000/dashboard
 | `ONE_MIN_UPSTREAM_RETRIES` | `2` | Retries on 429/5xx/network errors (jittered backoff) |
 | `ONE_MIN_STREAM_IDLE_MS` | `60000` | Abort a stream that is silent this long (no fixed total cap) |
 | `RESPONSE_CACHE_ENABLED` / `RESPONSE_CACHE_TTL_S` / `RESPONSE_CACHE_MAX_ENTRIES` | `true` / `600` / `500` | In-memory response cache. Used for `temperature: 0` requests, or any request with `X-Bridge-Cache: on`; skip with `X-Bridge-Cache: bypass` or `Cache-Control: no-cache`. Responses carry `X-Bridge-Cache: HIT\|MISS\|COALESCED` and `X-Bridge-Route: openai\|legacy\|cache`. 1min.ai bills cached prompt tokens at full price, so this is the only credit saver |
+| `MODEL_GROUPS` | — | Model aliases with ordered fallback, e.g. `auto-smart=gpt-5\|gpt-4.1;my-fast=qwen3.7-flash\|gpt-4.1-nano`. Built-in `auto-cheap` = the 3 cheapest models the OpenAI endpoint serves. Response headers `X-Bridge-Model` / `X-Bridge-Group` show who answered |
+| `DAILY_CREDIT_BUDGET` / `CLIENT_BUDGETS` | — | Estimated-credit daily caps per client (`X-Bridge-Client` header), e.g. `CLIENT_BUDGETS=litellm=500000,pi=200000`; over budget → 429 `budget_exceeded` |
+| `CREDIT_ALERT_PERCENT` | `10` | Telegram/webhook alert when available credits drop below this % (checked at each check-in, max once/day) |
+| `ONE_MIN_UPSTREAM_WINDOW_MS` | `60000` | Rate-limit window. Send `X-Bridge-Priority: high\|low` to jump or yield the queue |
 | `ONE_MIN_OPENAI_CHAT_URL` | `https://api.1min.ai/openai/v1/chat/completions` | OpenAI-compatible upstream endpoint |
 | `AUTH_TOKEN` | — | Master proxy token for client authentication |
 | `PORT` | `3000` | Server listening port (Node.js) |

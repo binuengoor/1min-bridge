@@ -5,7 +5,7 @@
 //           UNIFY_CHAT_WITH_AI structured SSE, gpt-tokenizer token counts
 // ============================================================================
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { getModelData, isVisionModel } from "../model-registry.js";
@@ -36,6 +36,7 @@ import {
   type CachedChat,
 } from "../cache/response-cache.js";
 import { keyId } from "../upstream/core.js";
+import { runWithModelGroups } from "../model-groups.js";
 import { invalidRequestError, modelNotFoundError, sendError } from "../errors.js";
 import {
   ToolCallingEmulator,
@@ -44,6 +45,7 @@ import {
 import { parseToolCalls } from "../adapters/tool-parser.js";
 import { ResponseSanitizer } from "../adapters/sanitizer.js";
 import { calculateTokens } from "../utils/tokens.js";
+import { calculateCredits } from "../utils/credits.js";
 import type {
   Env,
   ChatCompletionRequest,
@@ -157,6 +159,7 @@ const chatRequestSchema = z.object({
   max_tokens: z.number().int().positive().optional(),
   max_completion_tokens: z.number().int().positive().optional(),
   top_p: z.number().optional(),
+  reasoning_effort: z.enum(["minimal", "low", "medium", "high"]).optional(),
   frequency_penalty: z.number().optional(),
   presence_penalty: z.number().optional(),
   stop: z.union([z.string(), z.array(z.string())]).optional(),
@@ -555,9 +558,18 @@ function buildStreamingResponse(
 // OpenAI-upstream helpers (native tool calling + passthrough streaming)
 // ---------------------------------------------------------------------------
 
+/** Models that accept `reasoning_effort` (others reject it with a 400). */
+function acceptsReasoningEffort(model: string): boolean {
+  return /^(gpt-5|o1|o3|o4)/.test(model);
+}
+
 function sampling(body: ChatCompletionRequest) {
   const maxTokens = body.max_tokens ?? body.max_completion_tokens;
+  const effort = (body as unknown as { reasoning_effort?: string }).reasoning_effort;
   return {
+    ...(effort && acceptsReasoningEffort(body.model.split(":")[0] ?? "")
+      ? { reasoning_effort: effort }
+      : {}),
     ...(body.temperature !== undefined ? { temperature: body.temperature } : {}),
     ...(body.top_p !== undefined ? { top_p: body.top_p } : {}),
     ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
@@ -826,11 +838,20 @@ function replayCachedStream(
 // ---------------------------------------------------------------------------
 
 app.post("/v1/chat/completions", async (c) => {
+  let raw: unknown;
+  try {
+    raw = await c.req.json();
+  } catch {
+    return sendError(c, invalidRequestError("Invalid JSON body"));
+  }
+  return runWithModelGroups(c, raw, handleChat);
+});
+
+async function handleChat(c: Context<Env>, raw: unknown): Promise<Response> {
   const apiKey = c.get("oneMinApiKey");
 
   let body: ChatCompletionRequest;
   try {
-    const raw = await c.req.json();
     body = chatRequestSchema.parse(raw) as unknown as ChatCompletionRequest;
   } catch (err) {
     if (err instanceof z.ZodError) {
@@ -988,12 +1009,16 @@ app.post("/v1/chat/completions", async (c) => {
       })
     : null;
 
-  const finish = (result: CachedChat, status: string): Response => {
+  const finish = async (result: CachedChat, status: string): Promise<Response> => {
     const promptTokens = result.usage?.prompt_tokens ?? 0;
     const completionTokens = result.usage?.completion_tokens ?? 0;
     c.set("promptTokens", promptTokens);
     c.set("completionTokens", completionTokens);
-    if (status === "HIT" || status === "COALESCED") c.set("credits", 0);
+    const estimate = await calculateCredits(cleanModel, promptTokens, completionTokens);
+    const free = status === "HIT" || status === "COALESCED";
+    c.set("credits", free ? 0 : estimate);
+    if (free) c.set("savedCredits", estimate);
+    c.header("X-Bridge-Credits", String(free ? 0 : estimate));
     const response: ChatCompletionResponse = {
       id: chatId,
       object: "chat.completion",
@@ -1029,6 +1054,10 @@ app.post("/v1/chat/completions", async (c) => {
           c.set("promptTokens", 0);
           c.set("completionTokens", 0);
           c.set("credits", 0);
+          c.set(
+            "savedCredits",
+            await calculateCredits(cleanModel, hit.usage?.prompt_tokens ?? 0, hit.usage?.completion_tokens ?? 0),
+          );
           return withHeaders(replayCachedStream(hit, cleanModel, chatId, includeUsage), {
             "X-Bridge-Cache": "HIT",
             "X-Bridge-Route": "cache",
@@ -1182,13 +1211,13 @@ app.post("/v1/chat/completions", async (c) => {
 
     if (key) {
       const { value, status } = await cacheGetOrCompute(key, generate);
-      return finish(value, status);
+      return await finish(value, status);
     }
-    return finish(await generate(), "BYPASS");
+    return await finish(await generate(), "BYPASS");
   } catch (err) {
     console.error("Chat completion error:", err);
     throw err;
   }
-});
+}
 
 export default app;

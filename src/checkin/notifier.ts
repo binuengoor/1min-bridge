@@ -151,3 +151,27 @@ export async function dispatchCheckinNotification(
     await Promise.allSettled(tasks);
   }
 }
+
+/** Sends a plain-text alert (e.g. low credits) to Telegram and/or the webhook. */
+export async function dispatchTextAlert(config: CheckinConfig, text: string): Promise<void> {
+  const tasks: Promise<unknown>[] = [];
+  if (config.telegramBotToken && config.telegramChatId) {
+    tasks.push(
+      fetch(`https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: config.telegramChatId, text }),
+      }).catch((err) => console.warn("[Alert] Telegram error:", (err as Error).message)),
+    );
+  }
+  if (config.webhookUrl) {
+    tasks.push(
+      fetch(config.webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, content: text }),
+      }).catch((err) => console.warn("[Alert] Webhook error:", (err as Error).message)),
+    );
+  }
+  await Promise.allSettled(tasks);
+}

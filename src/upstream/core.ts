@@ -4,6 +4,7 @@
 // ============================================================================
 
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { config } from "../config.js";
 import { RelayError, upstreamError } from "../errors.js";
 import { incrementCounter } from "../metrics.js";
@@ -64,6 +65,11 @@ export async function getEndpointModels(apiKey: string): Promise<Set<string> | n
   return modelSet;
 }
 
+/** Synchronous peek at the cached endpoint model list (null if unknown). */
+export function peekEndpointModels(): Set<string> | null {
+  return modelSet;
+}
+
 /** Test hook. */
 export function _setEndpointModels(models: string[] | null): void {
   modelSet = models ? new Set(models) : null;
@@ -110,37 +116,100 @@ interface Window {
   blockedUntil: number;
 }
 const windows = new Map<string, Window>();
-const WINDOW_MS = 60_000;
 
-export async function acquireSlot(apiKey: string): Promise<void> {
+/** Per-request context (priority) carried to the limiter without threading args. */
+export const requestContext = new AsyncLocalStorage<{ priority: number; noLegacyFallback?: boolean }>();
+
+export function priorityFromHeader(value: string | undefined | null): number {
+  const v = (value ?? "").toLowerCase();
+  if (v === "high" || v === "interactive") return 2;
+  if (v === "low" || v === "batch") return 0;
+  return 1;
+}
+
+interface Waiter {
+  prio: number;
+  seq: number;
+  resolve: () => void;
+  reject: (e: unknown) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+const queues = new Map<string, Waiter[]>();
+const pumps = new Map<string, ReturnType<typeof setTimeout>>();
+let waiterSeq = 0;
+
+function tryTake(w: Window): boolean {
+  const now = Date.now();
+  w.stamps = w.stamps.filter((t) => now - t < config.upstreamWindowMs);
+  if (w.blockedUntil > now || w.stamps.length >= config.upstreamRpm) return false;
+  w.stamps.push(now);
+  return true;
+}
+
+function nextSlotDelay(w: Window): number {
+  const now = Date.now();
+  let wait = Math.max(0, w.blockedUntil - now);
+  if (w.stamps.length >= config.upstreamRpm) {
+    wait = Math.max(wait, w.stamps[0]! + config.upstreamWindowMs - now + 25);
+  }
+  return Math.max(wait, 10);
+}
+
+function pump(id: string): void {
+  pumps.delete(id);
+  const q = queues.get(id);
+  const w = windows.get(id);
+  if (!q || !w) return;
+  while (q.length > 0 && tryTake(w)) {
+    const next = q.shift()!;
+    clearTimeout(next.timer);
+    next.resolve();
+  }
+  if (q.length > 0 && !pumps.has(id)) {
+    pumps.set(id, setTimeout(() => pump(id), nextSlotDelay(w)));
+  }
+}
+
+/**
+ * Take one upstream slot for this key (sliding 60 s window). Waiters are served
+ * by priority (high > normal > low), then FIFO; a waiter that cannot be served
+ * within upstreamMaxWaitMs is rejected with 429.
+ */
+export function acquireSlot(apiKey: string): Promise<void> {
   const id = keyId(apiKey);
   const w = windows.get(id) ?? { stamps: [], blockedUntil: 0 };
   windows.set(id, w);
-  const deadline = Date.now() + config.upstreamMaxWaitMs;
+  const q = queues.get(id) ?? [];
+  queues.set(id, q);
+  if (q.length === 0 && tryTake(w)) return Promise.resolve();
 
-  while (true) {
-    const now = Date.now();
-    w.stamps = w.stamps.filter((t) => now - t < WINDOW_MS);
-    let wait = Math.max(0, w.blockedUntil - now);
-    if (w.stamps.length >= config.upstreamRpm) {
-      wait = Math.max(wait, w.stamps[0]! + WINDOW_MS - now + 25);
-    }
-    if (wait === 0) {
-      w.stamps.push(now);
-      return;
-    }
-    if (now + wait > deadline) {
-      incrementCounter("1min_bridge_upstream_ratelimit_rejected_total", {});
-      throw new RelayError(
-        "Upstream rate limit reached (1min.ai allows ~60 requests/minute per key). Retry shortly.",
-        429,
-        "rate_limit_exceeded",
-        "rate_limit_exceeded",
-      );
-    }
-    incrementCounter("1min_bridge_upstream_ratelimit_waits_total", {});
-    await sleep(wait);
-  }
+  const prio = requestContext.getStore()?.priority ?? 1;
+  incrementCounter("1min_bridge_upstream_ratelimit_waits_total", {});
+  return new Promise<void>((resolve, reject) => {
+    const waiter: Waiter = {
+      prio,
+      seq: ++waiterSeq,
+      resolve,
+      reject,
+      timer: setTimeout(() => {
+        const i = q.indexOf(waiter);
+        if (i >= 0) q.splice(i, 1);
+        incrementCounter("1min_bridge_upstream_ratelimit_rejected_total", {});
+        reject(
+          new RelayError(
+            "Upstream rate limit reached (1min.ai allows ~60 requests/minute per key). Retry shortly.",
+            429,
+            "rate_limit_exceeded",
+            "rate_limit_exceeded",
+          ),
+        );
+      }, config.upstreamMaxWaitMs),
+    };
+    let i = q.length;
+    while (i > 0 && q[i - 1]!.prio < prio) i--; // keep higher priority ahead, FIFO within a level
+    q.splice(i, 0, waiter);
+    if (!pumps.has(id)) pumps.set(id, setTimeout(() => pump(id), nextSlotDelay(w)));
+  });
 }
 
 function noteRateHeaders(apiKey: string, headers: Headers): void {

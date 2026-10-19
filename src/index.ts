@@ -9,6 +9,8 @@ import { authMiddleware } from "./middleware/auth.js";
 import { rateLimitMiddleware } from "./middleware/rate-limit.js";
 import { RelayError, sendError } from "./errors.js";
 import { incrementCounter, observeHistogram } from "./metrics.js";
+import { addSpend, checkBudget, clientLabel } from "./budget.js";
+import { priorityFromHeader, requestContext } from "./upstream/core.js";
 import type { Env } from "./types.js";
 
 import healthRoutes from "./routes/health.js";
@@ -96,8 +98,15 @@ app.use("*", async (c, next) => {
   activeRequests++;
   const start = Date.now();
 
+  const isLlmPath = c.req.path.startsWith("/v1/") && c.req.method === "POST";
+  const client = clientLabel(c.req.header("X-Bridge-Client"));
+
   try {
-    await next();
+    if (isLlmPath) checkBudget(client);
+    await requestContext.run(
+      { priority: priorityFromHeader(c.req.header("X-Bridge-Priority")) },
+      () => next(),
+    );
   } finally {
     const ms = Date.now() - start;
     activeRequests--;
@@ -134,6 +143,10 @@ app.use("*", async (c, next) => {
         credits = await calculateCredits(model, promptTokens, completionTokens);
       }
 
+      if (isLlmPath) addSpend(client, credits ?? 0);
+      const saved = c.get("savedCredits");
+      if (saved) incrementCounter("1min_bridge_credits_saved_total", { model: model ?? "unknown" }, Math.round(saved));
+
       statsTracker.recordRequest({
         method: c.req.method,
         path: reqPath,
@@ -143,6 +156,7 @@ app.use("*", async (c, next) => {
         promptTokens,
         completionTokens,
         credits: credits ?? 0,
+        savedCredits: saved ?? 0,
         requestId,
       });
     }

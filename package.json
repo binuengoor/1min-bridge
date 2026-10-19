@@ -8,7 +8,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "test": "tsx test/verify-fixes.ts"
+    "test": "tsx test/verify-fixes.ts && tsx test/integration.ts",
+    "test:integration": "tsx test/integration.ts"
   },
   "dependencies": {
     "@hono/node-server": "^1.19.11",
